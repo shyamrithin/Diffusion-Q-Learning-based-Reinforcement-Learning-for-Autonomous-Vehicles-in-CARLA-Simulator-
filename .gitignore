@@ -1,0 +1,10 @@
+checkpoints/
+checkpoints_old/
+runs/
+__pycache__/
+*.pyc
+*.pth
+*.egg-info/
+*.hdf5
+.env
+Diffusion-Policies-for-Offline-RL/

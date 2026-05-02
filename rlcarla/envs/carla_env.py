@@ -1,0 +1,649 @@
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import carla
+import random
+import math
+import logging
+import time
+
+from rlcarla.sensors.lidar         import LidarSensor
+from rlcarla.sensors.camera        import CameraManager
+from rlcarla.core.obs_builder      import (
+    ObservationBuilder, FrameStack,
+    SINGLE_OBS_DIM, OBS_DIM
+)
+from rlcarla.utils.reward          import RewardCalculator
+from rlcarla.utils.traffic_manager import TrafficManager
+
+logger = logging.getLogger(__name__)
+
+
+class EnvConfig:
+
+    HOST             = "localhost"
+    PORT             = 2000
+    TIMEOUT          = 30.0
+    FIXED_DT         = 0.05
+    MAX_STEPS        = 1000
+    CAM_WIDTH        = 800
+    CAM_HEIGHT       = 450
+    CAM_FOV          = 100
+    SPAWN_RETRIES    = 30
+    SAFE_SPAWN_DIST  = 20.0
+    STUCK_LIMIT      = 60
+    STUCK_SPEED      = 0.3
+    COLLISION_DONE   = True
+    OFFROAD_DONE     = True
+    WRONG_LANE_DONE  = True
+    WRONG_LANE_LIMIT = 10
+    WRONG_WAY_DONE   = True
+    TRAFFIC_PRESET   = "empty"
+    TRAFFIC_LIGHTS   = "off"
+    SPECTATOR_MODE   = "follow"
+    MAPS             = ["Town01"]
+
+    @classmethod
+    def from_dict(cls, d):
+        cfg     = cls()
+        mapping = {
+            'town'             : ('MAPS',           lambda v: [v]),
+            'port'             : ('PORT',           lambda v: v),
+            'dt'               : ('FIXED_DT',       lambda v: v),
+            'max_time_episode' : ('MAX_STEPS',      lambda v: v),
+            'traffic'          : ('TRAFFIC_LIGHTS', lambda v: v),
+        }
+        for key, (attr, transform) in mapping.items():
+            if key in d:
+                setattr(cfg, attr, transform(d[key]))
+        return cfg
+
+
+class CarlaEnv(gym.Env):
+
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(self, config=None, traffic_preset=None, map_name=None):
+        super().__init__()
+
+        self.cfg             = config or EnvConfig()
+        self._map_name       = map_name
+        self._traffic_preset = traffic_preset or self.cfg.TRAFFIC_PRESET
+
+        self.observation_space = spaces.Box(
+            low=-1.0, high=1.0,
+            shape=(OBS_DIM,),
+            dtype=np.float32
+        )
+        self.action_space = spaces.Box(
+            low=np.array( [0.0, -1.0, 0.0], dtype=np.float32),
+            high=np.array([1.0,  1.0, 1.0], dtype=np.float32),
+            dtype=np.float32
+        )
+
+        self.vehicle           = None
+        self.actor_list        = []
+        self._lidar            = None
+        self._camera           = None
+        self._traffic          = None
+        self._obs_builder      = ObservationBuilder()
+        self._frame_stack      = FrameStack()
+        self._reward_calc      = RewardCalculator()
+
+        self._collision_flag   = False
+        self._offroad_flag     = False
+        self._wrong_way_flag   = False
+        self._stuck_count      = 0
+        self._wrong_lane_count = 0
+        self._step_count       = 0
+        self._episode_reward   = 0.0
+        self._episode          = 0
+        self._prev_action      = np.zeros(3, dtype=np.float32)
+        self._collision_sensor = None
+
+        self._connect()
+
+    # ==========================================================
+    # CONNECTION
+    # ==========================================================
+    def _connect(self):
+        logger.info("[Env] Connecting to CARLA...")
+        self.client    = carla.Client(self.cfg.HOST, self.cfg.PORT)
+        self.client.set_timeout(self.cfg.TIMEOUT)
+        self.world     = self.client.get_world()
+        self.carla_map = self.world.get_map()
+        self._apply_sync_settings()
+        logger.info(f"[Env] Connected. Map: {self.carla_map.name}")
+
+    def _apply_sync_settings(self):
+        settings                     = self.world.get_settings()
+        settings.synchronous_mode    = True
+        settings.fixed_delta_seconds = self.cfg.FIXED_DT
+        self.world.apply_settings(settings)
+        self._obs_builder._dt        = self.cfg.FIXED_DT
+
+    # ==========================================================
+    # MAP
+    # ==========================================================
+    def _load_map(self, map_name=None):
+        current = self.world.get_map().name.split("/")[-1]
+        if map_name is not None and map_name != current:
+            logger.info(f"[Env] Loading map: {map_name}")
+            self.world     = self.client.load_world(map_name)
+            self.carla_map = self.world.get_map()
+            self._apply_sync_settings()
+            time.sleep(3.0)
+        else:
+            self.carla_map = self.world.get_map()
+
+    # ==========================================================
+    # TRAFFIC LIGHTS
+    # ==========================================================
+    def _configure_traffic_lights(self):
+        actors = self.world.get_actors().filter(
+            "traffic.traffic_light*"
+        )
+        if self.cfg.TRAFFIC_LIGHTS == "off":
+            for actor in actors:
+                actor.set_state(carla.TrafficLightState.Green)
+                actor.freeze(True)
+            logger.info("[Env] Traffic lights frozen GREEN")
+        else:
+            for actor in actors:
+                actor.freeze(False)
+            logger.info("[Env] Traffic lights NORMAL")
+
+    # ==========================================================
+    # SPECTATOR
+    # ==========================================================
+    def _update_spectator(self):
+        if self.cfg.SPECTATOR_MODE == "none" or self.vehicle is None:
+            return
+
+        spectator = self.world.get_spectator()
+        tf        = self.vehicle.get_transform()
+
+        if self.cfg.SPECTATOR_MODE == "follow":
+            cam_loc = tf.transform(carla.Location(x=-6.0, z=3.0))
+            cam_rot = carla.Rotation(
+                pitch=-10, yaw=tf.rotation.yaw, roll=0
+            )
+            spectator.set_transform(
+                carla.Transform(cam_loc, cam_rot)
+            )
+        elif self.cfg.SPECTATOR_MODE == "top":
+            spectator.set_transform(carla.Transform(
+                tf.location + carla.Location(z=40),
+                carla.Rotation(pitch=-90)
+            ))
+
+    # ==========================================================
+    # TRAJECTORY OVERLAY
+    # ==========================================================
+    def _draw_trajectory_overlay(self):
+        """
+        White dots  — road centerline (ideal path)
+        Green line  — kinematic prediction (agent intention)
+        """
+        if self.vehicle is None:
+            return
+
+        tf  = self.vehicle.get_transform()
+        loc = tf.location
+
+        # --- Road centerline — WHITE dots ---
+        wp      = self.carla_map.get_waypoint(
+            loc, project_to_road=True
+        )
+        current = wp
+        for i in range(20):
+            nexts = current.next(2.0)
+            if not nexts:
+                break
+            current   = nexts[0]
+            wloc      = current.transform.location
+            intensity = max(120, 255 - i * 7)
+            self.world.debug.draw_point(
+                carla.Location(
+                    x=wloc.x, y=wloc.y, z=wloc.z + 0.3
+                ),
+                size      = 0.10,
+                color     = carla.Color(
+                    intensity, intensity, intensity
+                ),
+                life_time = 0.06,
+            )
+
+        # --- Kinematic prediction — GREEN line ---
+        vel       = self.vehicle.get_velocity()
+        control   = self.vehicle.get_control()
+        speed     = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
+        steer     = control.steer
+        x         = loc.x
+        y         = loc.y
+        z         = loc.z + 0.3
+        yaw       = math.radians(tf.rotation.yaw)
+        wheelbase = 2.87
+        dt        = 0.1
+        n_steps   = 25
+        prev_loc  = carla.Location(x=x, y=y, z=z)
+
+        for i in range(n_steps):
+            if speed < 0.1:
+                break
+            if abs(steer) > 0.01:
+                turn_radius = wheelbase / math.tan(
+                    abs(steer) * 0.5 + 1e-6
+                )
+                d_yaw = (speed * dt) / turn_radius
+                d_yaw = d_yaw if steer > 0 else -d_yaw
+            else:
+                d_yaw = 0.0
+
+            yaw     += d_yaw
+            x       += speed * math.cos(yaw) * dt
+            y       += speed * math.sin(yaw) * dt
+
+            intensity = max(80, 255 - i * 7)
+            new_loc   = carla.Location(x=x, y=y, z=z)
+
+            self.world.debug.draw_line(
+                prev_loc, new_loc,
+                thickness = 0.10,
+                color     = carla.Color(0, intensity, 0),
+                life_time = 0.06,
+            )
+            self.world.debug.draw_point(
+                new_loc,
+                size      = 0.08,
+                color     = carla.Color(0, intensity, 0),
+                life_time = 0.06,
+            )
+            prev_loc = new_loc
+
+    # ==========================================================
+    # SPAWN
+    # ==========================================================
+    def _spawn_vehicle(self):
+        bp_lib = self.world.get_blueprint_library()
+        bp     = random.choice(bp_lib.filter("vehicle.tesla.model3"))
+        if bp.has_attribute("color"):
+            bp.set_attribute("color", "0,120,255")
+
+        spawn_points = self.carla_map.get_spawn_points()
+        random.shuffle(spawn_points)
+
+        for sp in spawn_points[:self.cfg.SPAWN_RETRIES]:
+            v = self.world.try_spawn_actor(bp, sp)
+            if v is not None:
+                self.vehicle = v
+                self.actor_list.append(v)
+                return True
+
+        logger.error("[Env] Failed to spawn ego vehicle!")
+        return False
+
+    # ==========================================================
+    # SENSORS
+    # ==========================================================
+    def _attach_sensors(self):
+        self._lidar = LidarSensor(self.vehicle, self.world)
+        self.actor_list.append(self._lidar._sensor)
+
+        self._camera = CameraManager(
+            self.vehicle, self.world,
+            width  = self.cfg.CAM_WIDTH,
+            height = self.cfg.CAM_HEIGHT,
+            fov    = self.cfg.CAM_FOV,
+        )
+        self.actor_list.append(self._camera._sensor)
+
+        col_bp = self.world.get_blueprint_library().find(
+            "sensor.other.collision"
+        )
+        self._collision_sensor = self.world.spawn_actor(
+            col_bp, carla.Transform(), attach_to=self.vehicle
+        )
+        self._collision_sensor.listen(self._on_collision)
+        self.actor_list.append(self._collision_sensor)
+
+    def _on_collision(self, event):
+        self._collision_flag = True
+        logger.debug(f"[Env] Collision: {event.other_actor.type_id}")
+
+    # ==========================================================
+    # TRAFFIC
+    # ==========================================================
+    def _spawn_traffic(self):
+        if self._traffic is not None:
+            self._traffic.destroy()
+        self._traffic = TrafficManager(self.client, self.world)
+        self._traffic.spawn(
+            preset      = self._traffic_preset,
+            ego_vehicle = self.vehicle,
+            safe_radius = self.cfg.SAFE_SPAWN_DIST,
+        )
+
+    # ==========================================================
+    # RESET
+    # ==========================================================
+    def reset(self, seed=None, options=None, map_name=None):
+        super().reset(seed=seed)
+        map_name = (options or {}).get("map_name", map_name)
+
+        self._episode += 1
+        logger.info(
+            f"[Env] Reset — episode {self._episode} | "
+            f"prev reward {self._episode_reward:.1f}"
+        )
+
+        self._cleanup()
+        self._load_map(map_name)
+
+        if not self._spawn_vehicle():
+            raise RuntimeError("Could not spawn ego vehicle.")
+
+        # Warm up physics
+        for _ in range(10):
+            self.world.tick()
+
+        self._attach_sensors()
+        self._configure_traffic_lights()
+        self._spawn_traffic()
+
+        # Kickstart — vehicle moving before episode begins
+        for _ in range(15):
+            self.vehicle.apply_control(carla.VehicleControl(
+                throttle = 0.5,
+                steer    = 0.0,
+                brake    = 0.0,
+            ))
+            self.world.tick()
+
+        # 🔥 Flush LiDAR queue — prevents FPS dip at episode start
+        if self._lidar is not None:
+            flushed = self._lidar.flush()
+            logger.debug(f"[Env] LiDAR queue flushed ({flushed} frames)")
+
+        # Reset episode state
+        self._collision_flag   = False
+        self._offroad_flag     = False
+        self._wrong_way_flag   = False
+        self._stuck_count      = 0
+        self._wrong_lane_count = 0
+        self._step_count       = 0
+        self._episode_reward   = 0.0
+        self._prev_action      = np.zeros(3, dtype=np.float32)
+
+        self._obs_builder.reset(self.vehicle)
+        self._reward_calc.reset()
+
+        # Warm up sensors
+        for _ in range(5):
+            self.world.tick()
+
+        raw_obs = self._obs_builder.build(
+            self.vehicle, self.carla_map,
+            self._lidar, self._traffic,
+        )
+        obs = self._frame_stack.reset(raw_obs)
+
+        self._update_spectator()
+        self._draw_trajectory_overlay()
+
+        return obs, {}
+
+    # ==========================================================
+    # STEP
+    # ==========================================================
+    def step(self, action):
+
+        self._step_count += 1
+
+        throttle = float(np.clip(action[0],  0.0, 1.0))
+        steer    = float(np.clip(action[1], -1.0, 1.0))
+        brake    = float(np.clip(action[2],  0.0, 1.0))
+
+        self.vehicle.apply_control(carla.VehicleControl(
+            throttle = throttle,
+            steer    = steer,
+            brake    = brake,
+        ))
+
+        self.world.tick()
+        self._update_spectator()
+        self._draw_trajectory_overlay()
+
+        raw_obs = self._obs_builder.build(
+            self.vehicle, self.carla_map,
+            self._lidar, self._traffic,
+        )
+        obs = self._frame_stack.step(raw_obs)
+
+        self._update_flags(action)
+
+        reward, reward_info = self._get_reward(obs, action)
+        self._episode_reward += reward
+
+        done, term_reason = self._terminal()
+
+        self._collision_flag = False
+        self._prev_action    = np.array(action, dtype=np.float32)
+
+        if done:
+            logger.info(
+                f"[Env] Done — {term_reason} | "
+                f"steps: {self._step_count} | "
+                f"reward: {self._episode_reward:.1f}"
+            )
+
+        info = {
+            "step"             : self._step_count,
+            "speed"            : self._get_speed(),
+            "episode_reward"   : self._episode_reward,
+            "term_reason"      : term_reason,
+            "wrong_lane_count" : self._wrong_lane_count,
+            "map"              : self.carla_map.name,
+            **reward_info,
+        }
+
+        return obs, reward, done, False, info
+
+    # ==========================================================
+    # FLAGS
+    # ==========================================================
+    def _update_flags(self, action):
+        speed = self._get_speed()
+
+        if speed < self.cfg.STUCK_SPEED:
+            self._stuck_count += 1
+        else:
+            self._stuck_count = 0
+
+        loc    = self.vehicle.get_location()
+        wp_raw = self.carla_map.get_waypoint(
+            loc, project_to_road=False
+        )
+        self._offroad_flag = (wp_raw is None)
+
+        wp_road = self.carla_map.get_waypoint(
+            loc,
+            project_to_road = True,
+            lane_type       = carla.LaneType.Driving
+        )
+
+        if wp_raw is not None and wp_road is not None:
+            in_wrong_lane = (wp_raw.lane_id * wp_road.lane_id < 0)
+        else:
+            in_wrong_lane = False
+
+        if in_wrong_lane:
+            self._wrong_lane_count += 1
+        else:
+            self._wrong_lane_count  = 0
+
+        self._wrong_way_flag = False
+        if wp_road is not None and not wp_road.is_junction:
+            ego_yaw  = self.vehicle.get_transform().rotation.yaw
+            lane_yaw = wp_road.transform.rotation.yaw
+            yaw_diff = math.radians(ego_yaw - lane_yaw)
+            yaw_diff = math.atan2(
+                math.sin(yaw_diff), math.cos(yaw_diff)
+            )
+            if abs(yaw_diff) > math.pi / 2:
+                self._wrong_way_flag = True
+
+    # ==========================================================
+    # TERMINAL
+    # ==========================================================
+    def _terminal(self):
+        if self._stuck_count > self.cfg.STUCK_LIMIT:
+            return True, "stuck"
+        if self.cfg.COLLISION_DONE and self._collision_flag:
+            return True, "collision"
+        if self.cfg.OFFROAD_DONE and self._offroad_flag:
+            return True, "offroad"
+        if (self.cfg.WRONG_LANE_DONE and
+                self._wrong_lane_count > self.cfg.WRONG_LANE_LIMIT):
+            return True, "wrong_lane"
+        if self.cfg.WRONG_WAY_DONE and self._wrong_way_flag:
+            return True, "wrong_way"
+        if self._step_count >= self.cfg.MAX_STEPS:
+            return True, "max_steps"
+        return False, None
+
+    # ==========================================================
+    # REWARD
+    # ==========================================================
+    def _get_reward(self, obs, action):
+        return self._reward_calc.compute(
+            vehicle    = self.vehicle,
+            carla_map  = self.carla_map,
+            obs        = obs,
+            action     = action,
+            collision  = self._collision_flag,
+            wrong_way  = self._wrong_way_flag,
+            wrong_lane = self._wrong_lane_count > 0,
+        )
+
+    # ==========================================================
+    # HELPERS
+    # ==========================================================
+    def _get_speed(self):
+        if self.vehicle is None:
+            return 0.0
+        v = self.vehicle.get_velocity()
+        return math.sqrt(v.x**2 + v.y**2 + v.z**2)
+
+    # ==========================================================
+    # CAMERA
+    # ==========================================================
+    def set_camera_view(self, view_name):
+        if self._camera is not None:
+            self._camera.set_view(view_name)
+            if self._camera._sensor not in self.actor_list:
+                self.actor_list.append(self._camera._sensor)
+
+    def get_camera_frame(self):
+        if self._camera is not None:
+            return self._camera.get_frame()
+        return None
+
+    def get_camera_intrinsic(self):
+        if self._camera is not None:
+            return self._camera.intrinsic
+        return None
+
+    def get_camera_transform(self):
+        if self._camera is not None:
+            return self._camera.get_transform()
+        return None
+
+    def available_views(self):
+        if self._camera is not None:
+            return self._camera.available_views
+        return []
+
+    def set_spectator_mode(self, mode):
+        self.cfg.SPECTATOR_MODE = mode
+
+    # ==========================================================
+    # TRAFFIC
+    # ==========================================================
+    def set_traffic_preset(self, preset):
+        self._traffic_preset = preset
+        if self._traffic is not None:
+            self._traffic.destroy()
+        self._spawn_traffic()
+
+    def set_traffic_count(self, n_vehicles, n_walkers=0):
+        self._traffic_preset = None
+        if self._traffic is not None:
+            self._traffic.destroy()
+        self._traffic = TrafficManager(self.client, self.world)
+        self._traffic.spawn(
+            n_vehicles  = n_vehicles,
+            n_walkers   = n_walkers,
+            ego_vehicle = self.vehicle,
+        )
+
+    def set_traffic_lights(self, mode):
+        self.cfg.TRAFFIC_LIGHTS = mode
+        self._configure_traffic_lights()
+
+    # ==========================================================
+    # CLEANUP
+    # ==========================================================
+    def _cleanup(self):
+        if self._lidar is not None:
+            self._lidar.destroy()
+            self._lidar = None
+
+        if self._camera is not None:
+            self._camera.destroy()
+            self._camera = None
+
+        if self._collision_sensor is not None:
+            try:
+                self._collision_sensor.stop()
+                self._collision_sensor.destroy()
+            except Exception:
+                pass
+            self._collision_sensor = None
+
+        if self._traffic is not None:
+            self._traffic.destroy()
+            self._traffic = None
+
+        if self.actor_list:
+            self.client.apply_batch([
+                carla.command.DestroyActor(a)
+                for a in self.actor_list
+            ])
+            self.actor_list = []
+
+        self.vehicle = None
+
+    def close(self):
+        self._cleanup()
+        try:
+            settings                     = self.world.get_settings()
+            settings.synchronous_mode    = False
+            settings.fixed_delta_seconds = None
+            self.world.apply_settings(settings)
+        except Exception:
+            pass
+        logger.info("[Env] Closed.")
+
+    # ==========================================================
+    # UTILS
+    # ==========================================================
+    def get_episode_info(self):
+        return {
+            "episode"       : self._episode,
+            "step"          : self._step_count,
+            "episode_reward": self._episode_reward,
+            "traffic"       : self._traffic_preset,
+            "map"           : self.carla_map.name.split("/")[-1],
+            "speed"         : self._get_speed(),
+        }
