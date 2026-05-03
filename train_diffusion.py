@@ -3,6 +3,7 @@ import time
 import traceback
 import logging
 import math
+import re
 
 import gymnasium as gym
 import rlcarla
@@ -35,14 +36,14 @@ class TrainConfig:
     HEIGHT         = 450
     FPS            = 20
 
-    MAX_EPISODES          = 500
+    MAX_EPISODES          = 1600
     MAX_STEPS             = 1000
 
     START_RANDOM_STEPS    = 10000
     POLICY_RANDOM_MIX     = 0.15
 
     BATCH_SIZE            = 256
-    TRAIN_FREQ            = 2
+    TRAIN_FREQ            = 4
     SAVE_EVERY            = 10
 
     BUFFER_SIZE           = 200000
@@ -50,17 +51,18 @@ class TrainConfig:
 
     DISCOUNT              = 0.99
     TAU                   = 0.005
-    ETA                   = 0.01
+    ETA                   = 0.005
     BETA_SCHEDULE         = "vp"
     N_TIMESTEPS           = 3
-    LR                    = 3e-4
+    LR                    = 1e-4
+    GRAD_NORM             = 0.5
     ACTION_TEMPERATURE    = 0.1
 
     CURRICULUM = [
-        (0,   "empty"),
-        (100, "light"),
-        (200, "medium"),
-        (350, "heavy"),
+        (0,    "empty"),
+        (100,  "light"),
+        (200,  "medium"),
+        (350,  "heavy"),
     ]
 
     TRAFFIC_LIGHT_CURRICULUM = [
@@ -76,6 +78,53 @@ class TrainConfig:
 
 
 cfg = TrainConfig()
+
+
+# ==========================================================
+# RESUME HELPER
+# ==========================================================
+def find_latest_checkpoint(checkpoint_dir):
+    if not os.path.exists(checkpoint_dir):
+        return 0, None
+
+    actor_files = [
+        f for f in os.listdir(checkpoint_dir)
+        if f.startswith("actor_") and f.endswith(".pth")
+    ]
+
+    episodes = []
+    for f in actor_files:
+        match = re.search(r"actor_(\d+)\.pth", f)
+        if match:
+            ep = int(match.group(1))
+            if ep != 9999:
+                episodes.append(ep)
+
+    if not episodes:
+        return 0, None
+
+    latest_ep = max(episodes)
+    return latest_ep, checkpoint_dir
+
+
+def resume_training(agent, checkpoint_dir):
+    latest_ep, path = find_latest_checkpoint(checkpoint_dir)
+
+    if latest_ep > 0:
+        agent.load_model(path, id=latest_ep)
+        logger.info(
+            f"Resumed from episode {latest_ep} checkpoint"
+        )
+        return latest_ep
+
+    best_path = os.path.join(checkpoint_dir, "actor_9999.pth")
+    if os.path.exists(best_path):
+        agent.load_model(checkpoint_dir, id=9999)
+        logger.info("Resumed from best model (9999)")
+        return 0
+
+    logger.info("No checkpoint found — starting fresh")
+    return 0
 
 
 # ==========================================================
@@ -172,79 +221,72 @@ def get_traffic_lights(episode):
 
 
 # ==========================================================
-# 3D LIDAR POINT CLOUD VISUALIZER
+# 3D LIDAR — SQUARE PANEL, NO FLICKER
 # ==========================================================
-def draw_point_cloud(
-    screen,
-    points,
-    center_x,
-    center_y,
-    radius    = 90,
-    max_range = 30.0,
-):
+def draw_point_cloud(screen, points, center_x, center_y,
+                     size=180, max_range=30.0):
     """
-    Top-down 2D projection of 3D LiDAR points.
-    Colored by height (z):
-      Dark grey  → ground       (z < -1.5m)
-      Grey       → near ground  (-1.5 to -0.5m)
-      Green      → vehicle lvl  (-0.5 to  0.5m)
-      Orange     → obstacle      (0.5 to  1.5m)
-      Blue       → tall object  (> 1.5m)
+    Square LiDAR point cloud display.
+    Renders every frame — no flickering.
     """
     font_s = pygame.font.SysFont("monospace", 10)
 
-    # Background
-    bg = pygame.Surface(
-        (radius * 2 + 4, radius * 2 + 4), pygame.SRCALPHA
-    )
-    pygame.draw.circle(
-        bg, (0, 0, 0, 175),
-        (radius + 2, radius + 2), radius + 2
-    )
-    screen.blit(bg, (center_x - radius - 2, center_y - radius - 2))
+    # Square background
+    bg = pygame.Surface((size, size), pygame.SRCALPHA)
+    bg.fill((0, 0, 0, 175))
+    screen.blit(bg, (center_x - size//2, center_y - size//2))
 
-    # Outer ring
-    pygame.draw.circle(
-        screen, (0, 130, 0), (center_x, center_y), radius, 1
+    # Border
+    pygame.draw.rect(
+        screen, (0, 130, 0),
+        (center_x - size//2, center_y - size//2, size, size),
+        1
     )
 
-    # Range rings
-    for r in [radius // 3, radius * 2 // 3]:
-        pygame.draw.circle(
-            screen, (0, 55, 0), (center_x, center_y), r, 1
+    # Center crosshairs
+    pygame.draw.line(
+        screen, (0, 40, 0),
+        (center_x - size//2, center_y),
+        (center_x + size//2, center_y), 1
+    )
+    pygame.draw.line(
+        screen, (0, 40, 0),
+        (center_x, center_y - size//2),
+        (center_x, center_y + size//2), 1
+    )
+
+    # Quarter grid lines
+    for offset in [-size//4, size//4]:
+        pygame.draw.line(
+            screen, (0, 25, 0),
+            (center_x - size//2, center_y + offset),
+            (center_x + size//2, center_y + offset), 1
         )
-
-    # Crosshairs
-    pygame.draw.line(
-        screen, (0, 40, 0),
-        (center_x - radius, center_y),
-        (center_x + radius, center_y), 1
-    )
-    pygame.draw.line(
-        screen, (0, 40, 0),
-        (center_x, center_y - radius),
-        (center_x, center_y + radius), 1
-    )
+        pygame.draw.line(
+            screen, (0, 25, 0),
+            (center_x + offset, center_y - size//2),
+            (center_x + offset, center_y + size//2), 1
+        )
 
     # Forward arrow
     pygame.draw.polygon(
         screen, (0, 255, 100),
         [
-            (center_x,     center_y - radius - 7),
-            (center_x - 4, center_y - radius + 1),
-            (center_x + 4, center_y - radius + 1),
+            (center_x,     center_y - size//2 - 7),
+            (center_x - 4, center_y - size//2 + 1),
+            (center_x + 4, center_y - size//2 + 1),
         ]
     )
 
     # Range labels
     lbl_30 = font_s.render("30m", True, (0, 90, 0))
-    lbl_10 = font_s.render("10m", True, (0, 70, 0))
-    screen.blit(lbl_30, (center_x + 4, center_y - radius + 2))
-    screen.blit(lbl_10, (center_x + 4, center_y - radius // 3 + 2))
+    lbl_15 = font_s.render("15m", True, (0, 70, 0))
+    screen.blit(lbl_30, (center_x + 3, center_y - size//2 + 2))
+    screen.blit(lbl_15, (center_x + 3, center_y - size//4 + 2))
 
     # Draw points
     if len(points) > 0:
-        scale = radius / max_range
+        scale = (size // 2) / max_range
         x_pts = points[:, 0]
         y_pts = points[:, 1]
         z_pts = points[:, 2]
@@ -256,28 +298,22 @@ def draw_point_cloud(
         z_pts = z_pts[mask]
 
         for i in range(len(x_pts)):
-            px = x_pts[i]
-            py = y_pts[i]
-            pz = z_pts[i]
+            rx = int(center_x - y_pts[i] * scale)
+            ry = int(center_y - x_pts[i] * scale)
 
-            rx = int(center_x - py * scale)
-            ry = int(center_y - px * scale)
-
-            dx = rx - center_x
-            dy = ry - center_y
-            if math.sqrt(dx**2 + dy**2) > radius:
+            # Clip to square boundary
+            if (rx < center_x - size//2 or
+                    rx > center_x + size//2 or
+                    ry < center_y - size//2 or
+                    ry > center_y + size//2):
                 continue
 
-            if pz < -1.5:
-                color = (50,  50,  50)
-            elif pz < -0.5:
-                color = (100, 100, 100)
-            elif pz < 0.5:
-                color = (0,   180,  80)
-            elif pz < 1.5:
-                color = (255, 140,   0)
-            else:
-                color = (80,  80,  255)
+            pz = z_pts[i]
+            if pz < -1.5:   color = (50,  50,  50)
+            elif pz < -0.5: color = (100, 100, 100)
+            elif pz < 0.5:  color = (0,   180,  80)
+            elif pz < 1.5:  color = (255, 140,   0)
+            else:           color = (80,  80,  255)
 
             pygame.draw.circle(screen, color, (rx, ry), 2)
 
@@ -291,13 +327,12 @@ def draw_point_cloud(
 
     # Title
     title = font_s.render("LiDAR 3D", True, (0, 200, 0))
-    screen.blit(
-        title,
-        (center_x - title.get_width() // 2,
-         center_y + radius + 5)
-    )
+    screen.blit(title, (
+        center_x - title.get_width() // 2,
+        center_y + size//2 + 4
+    ))
 
-    # Height legend
+    # Height legend inside bottom left
     legend = [
         ((50,  50,  50),  "gnd"),
         ((100, 100, 100), "low"),
@@ -305,26 +340,24 @@ def draw_point_cloud(
         ((255, 140,   0), "obj"),
         ((80,  80,  255), "top"),
     ]
-    lx = center_x - radius
-    ly = center_y + radius - 65
+    lx = center_x - size//2 + 4
+    ly = center_y + size//2 - 75
     for color, label in legend:
-        pygame.draw.circle(screen, color, (lx + 5, ly + 4), 4)
+        pygame.draw.circle(screen, color, (lx+4, ly+4), 3)
         lbl = font_s.render(label, True, color)
-        screen.blit(lbl, (lx + 12, ly))
+        screen.blit(lbl, (lx+10, ly))
         ly += 14
 
 
 # ==========================================================
 # HUD
 # ==========================================================
-def draw_hud(
-    screen, font, info,
-    total_steps, episode, ep_reward,
-    replay_size, traffic_preset,
-    tl_mode, view,
-):
+def draw_hud(screen, font, info, total_steps, episode,
+             ep_reward, replay_size, traffic_preset,
+             tl_mode, view, start_episode):
+
     lines = [
-        f"Episode     : {episode}",
+        f"Episode     : {episode} (+{episode-start_episode})",
         f"Step        : {info.get('step', 0)}",
         f"Total Steps : {total_steps}",
         f"Ep Reward   : {ep_reward:.1f}",
@@ -337,14 +370,14 @@ def draw_hud(
     ]
 
     surf = pygame.Surface(
-        (230, len(lines) * 22 + 10), pygame.SRCALPHA
+        (240, len(lines)*22+10), pygame.SRCALPHA
     )
     surf.fill((0, 0, 0, 140))
     screen.blit(surf, (5, 5))
 
     for i, line in enumerate(lines):
         txt = font.render(line, True, (255, 255, 255))
-        screen.blit(txt, (10, 10 + i * 22))
+        screen.blit(txt, (10, 10+i*22))
 
 
 # ==========================================================
@@ -357,7 +390,7 @@ clock  = pygame.time.Clock()
 font   = pygame.font.SysFont("monospace", 16)
 
 # ==========================================================
-# ENV + AGENT + BUFFER + LOGGER
+# ENV + AGENT + BUFFER
 # ==========================================================
 os.makedirs(cfg.CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(cfg.LOG_DIR,        exist_ok=True)
@@ -377,20 +410,28 @@ agent = Diffusion_QL(
     beta_schedule      = cfg.BETA_SCHEDULE,
     n_timesteps        = cfg.N_TIMESTEPS,
     lr                 = cfg.LR,
+    grad_norm          = cfg.GRAD_NORM,
     action_temperature = cfg.ACTION_TEMPERATURE,
 )
 
+# ==========================================================
+# RESUME
+# ==========================================================
+start_episode = resume_training(agent, cfg.CHECKPOINT_DIR)
+
 replay       = ReplayBuffer(OBS_DIM, 3, cfg.BUFFER_SIZE)
 best_reward  = -1e9
-total_steps  = 0
+total_steps  = start_episode * 500
 current_view = "third_person"
 
-logger.info(f"Device      : {cfg.DEVICE}")
-logger.info(f"Obs dim     : {OBS_DIM}")
-logger.info(f"Buffer size : {cfg.BUFFER_SIZE}")
-logger.info(f"Max eps     : {cfg.MAX_EPISODES}")
-logger.info(f"Max steps   : {cfg.MAX_STEPS}")
-logger.info(f"LiDAR       : 32ch 3D (30m range)")
+logger.info(f"Device        : {cfg.DEVICE}")
+logger.info(f"Obs dim       : {OBS_DIM}")
+logger.info(f"Start episode : {start_episode}")
+logger.info(f"Target end    : {cfg.MAX_EPISODES}")
+logger.info(f"New episodes  : ~{cfg.MAX_EPISODES - start_episode}")
+logger.info(f"LR            : {cfg.LR}")
+logger.info(f"Train freq    : {cfg.TRAIN_FREQ}")
+logger.info(f"Grad norm     : {cfg.GRAD_NORM}")
 
 # ==========================================================
 # TRAINING LOOP
@@ -398,7 +439,7 @@ logger.info(f"LiDAR       : 32ch 3D (30m range)")
 running = True
 
 try:
-    for episode in range(cfg.MAX_EPISODES):
+    for episode in range(start_episode, cfg.MAX_EPISODES):
 
         if not running:
             break
@@ -420,7 +461,6 @@ try:
 
         for step in range(cfg.MAX_STEPS):
 
-            # ---- Pygame events ----
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -429,7 +469,6 @@ try:
             if keys[pygame.K_ESCAPE]:
                 running = False
 
-            # Camera switching
             if keys[pygame.K_1]:
                 current_view = "third_person"
                 env.unwrapped.set_camera_view(current_view)
@@ -443,7 +482,6 @@ try:
                 current_view = "bird_eye"
                 env.unwrapped.set_camera_view(current_view)
 
-            # Spectator mode
             if keys[pygame.K_5]:
                 env.unwrapped.set_spectator_mode("follow")
             elif keys[pygame.K_6]:
@@ -454,7 +492,6 @@ try:
             if not running:
                 break
 
-            # ---- Action ----
             action = choose_action(
                 agent, state, prev_action, total_steps
             )
@@ -469,7 +506,6 @@ try:
             total_steps += 1
             ep_info     = info
 
-            # ---- Train ----
             if (len(replay) > cfg.BATCH_SIZE and
                     total_steps % cfg.TRAIN_FREQ == 0):
 
@@ -511,18 +547,17 @@ try:
                 screen, font, ep_info,
                 total_steps, episode, ep_reward,
                 len(replay), traffic_preset,
-                tl_mode, current_view,
+                tl_mode, current_view, start_episode,
             )
 
-            # ---- 3D LiDAR Point Cloud ----
+            # ---- LiDAR — every frame, square panel ----
             if env.unwrapped._lidar is not None:
                 points = env.unwrapped._lidar.get_points()
                 draw_point_cloud(
-                    screen,
-                    points,
-                    center_x  = cfg.WIDTH  - 115,
-                    center_y  = cfg.HEIGHT - 115,
-                    radius    = 90,
+                    screen, points,
+                    center_x  = cfg.WIDTH  - 100,
+                    center_y  = cfg.HEIGHT - 100,
+                    size      = 180,
                     max_range = 30.0,
                 )
 
@@ -532,27 +567,18 @@ try:
             if done or trunc:
                 break
 
-        # ---- Episode logging ----
-        writer.add_scalar(
-            "reward/episode",     ep_reward, episode
-        )
-        writer.add_scalar(
-            "reward/total_steps", ep_reward, total_steps
-        )
-        writer.add_scalar(
-            "env/episode_length", step + 1,  episode
-        )
+        # ---- Logging ----
+        writer.add_scalar("reward/episode",     ep_reward, episode)
+        writer.add_scalar("reward/total_steps", ep_reward, total_steps)
+        writer.add_scalar("env/episode_length", step+1,    episode)
 
         if ep_bc_loss:
             writer.add_scalar(
-                "loss/bc",     np.mean(ep_bc_loss), episode
-            )
+                "loss/bc",     np.mean(ep_bc_loss), episode)
             writer.add_scalar(
-                "loss/ql",     np.mean(ep_ql_loss), episode
-            )
+                "loss/critic", np.mean(ep_cr_loss), episode)
             writer.add_scalar(
-                "loss/critic", np.mean(ep_cr_loss), episode
-            )
+                "loss/ql",     np.mean(ep_ql_loss), episode)
 
         for key in [
             "forward_progress", "lane_center", "yaw_align",
@@ -565,13 +591,13 @@ try:
                 )
 
         logger.info(
-            f"Ep {episode:04d} | "
+            f"Ep {episode:04d} (+{episode-start_episode:04d}) | "
             f"Reward {ep_reward:8.2f} | "
             f"Steps {step+1:4d} | "
             f"Traffic {traffic_preset:6s} | "
             f"Lights {tl_mode:3s} | "
             f"Buffer {len(replay):6d} | "
-            f"Done: {ep_info.get('term_reason', 'trunc')}"
+            f"Done: {ep_info.get('term_reason','trunc')}"
         )
 
         if episode % cfg.SAVE_EVERY == 0:
@@ -581,7 +607,9 @@ try:
         if ep_reward > best_reward:
             best_reward = ep_reward
             agent.save_model(cfg.CHECKPOINT_DIR, id=9999)
-            logger.info(f"New best — reward {best_reward:.2f}")
+            logger.info(
+                f"New best — reward {best_reward:.2f}"
+            )
 
 except KeyboardInterrupt:
     logger.info("Stopped by user.")

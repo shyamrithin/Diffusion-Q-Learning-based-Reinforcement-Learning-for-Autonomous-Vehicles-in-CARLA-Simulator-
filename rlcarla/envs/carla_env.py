@@ -19,6 +19,12 @@ from rlcarla.utils.traffic_manager import TrafficManager
 logger = logging.getLogger(__name__)
 
 
+def _wrap_angle(angle):
+    while angle >  180: angle -= 360
+    while angle < -180: angle += 360
+    return angle
+
+
 class EnvConfig:
 
     HOST             = "localhost"
@@ -31,17 +37,23 @@ class EnvConfig:
     CAM_FOV          = 100
     SPAWN_RETRIES    = 30
     SAFE_SPAWN_DIST  = 20.0
-    STUCK_LIMIT      = 60
+    STUCK_LIMIT      = 80
     STUCK_SPEED      = 0.3
     COLLISION_DONE   = True
     OFFROAD_DONE     = True
     WRONG_LANE_DONE  = True
-    WRONG_LANE_LIMIT = 10
+    WRONG_LANE_LIMIT = 3        # strict — almost immediate
     WRONG_WAY_DONE   = True
     TRAFFIC_PRESET   = "empty"
     TRAFFIC_LIGHTS   = "off"
     SPECTATOR_MODE   = "follow"
-    MAPS             = ["Town01"]
+
+    # Town03 — best curves + roundabouts
+    MAPS = ["Town03"]
+
+    # Curve spawn bias
+    CURVE_SPAWN_BIAS = 0.6
+    CURVE_MIN_ANGLE  = 5.0
 
     @classmethod
     def from_dict(cls, d):
@@ -127,9 +139,11 @@ class CarlaEnv(gym.Env):
     # ==========================================================
     def _load_map(self, map_name=None):
         current = self.world.get_map().name.split("/")[-1]
-        if map_name is not None and map_name != current:
-            logger.info(f"[Env] Loading map: {map_name}")
-            self.world     = self.client.load_world(map_name)
+        target  = map_name or random.choice(self.cfg.MAPS)
+
+        if target != current:
+            logger.info(f"[Env] Loading map: {target}")
+            self.world     = self.client.load_world(target)
             self.carla_map = self.world.get_map()
             self._apply_sync_settings()
             time.sleep(3.0)
@@ -181,17 +195,13 @@ class CarlaEnv(gym.Env):
     # TRAJECTORY OVERLAY
     # ==========================================================
     def _draw_trajectory_overlay(self):
-        """
-        White dots  — road centerline (ideal path)
-        Green line  — kinematic prediction (agent intention)
-        """
         if self.vehicle is None:
             return
 
         tf  = self.vehicle.get_transform()
         loc = tf.location
 
-        # --- Road centerline — WHITE dots ---
+        # White dots — road centerline
         wp      = self.carla_map.get_waypoint(
             loc, project_to_road=True
         )
@@ -214,7 +224,7 @@ class CarlaEnv(gym.Env):
                 life_time = 0.06,
             )
 
-        # --- Kinematic prediction — GREEN line ---
+        # Green line — kinematic prediction
         vel       = self.vehicle.get_velocity()
         control   = self.vehicle.get_control()
         speed     = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
@@ -224,25 +234,23 @@ class CarlaEnv(gym.Env):
         z         = loc.z + 0.3
         yaw       = math.radians(tf.rotation.yaw)
         wheelbase = 2.87
-        dt        = 0.1
-        n_steps   = 25
         prev_loc  = carla.Location(x=x, y=y, z=z)
 
-        for i in range(n_steps):
+        for i in range(25):
             if speed < 0.1:
                 break
             if abs(steer) > 0.01:
                 turn_radius = wheelbase / math.tan(
                     abs(steer) * 0.5 + 1e-6
                 )
-                d_yaw = (speed * dt) / turn_radius
+                d_yaw = (speed * 0.1) / turn_radius
                 d_yaw = d_yaw if steer > 0 else -d_yaw
             else:
                 d_yaw = 0.0
 
             yaw     += d_yaw
-            x       += speed * math.cos(yaw) * dt
-            y       += speed * math.sin(yaw) * dt
+            x       += speed * math.cos(yaw) * 0.1
+            y       += speed * math.sin(yaw) * 0.1
 
             intensity = max(80, 255 - i * 7)
             new_loc   = carla.Location(x=x, y=y, z=z)
@@ -253,27 +261,50 @@ class CarlaEnv(gym.Env):
                 color     = carla.Color(0, intensity, 0),
                 life_time = 0.06,
             )
-            self.world.debug.draw_point(
-                new_loc,
-                size      = 0.08,
-                color     = carla.Color(0, intensity, 0),
-                life_time = 0.06,
-            )
             prev_loc = new_loc
 
     # ==========================================================
-    # SPAWN
+    # CURVE-BIASED SPAWN
     # ==========================================================
+    def _get_curve_spawn_points(self):
+        spawn_points = self.carla_map.get_spawn_points()
+        curved = []
+
+        for sp in spawn_points:
+            wp = self.carla_map.get_waypoint(sp.location)
+            if wp is None:
+                continue
+            nexts = wp.next(10.0)
+            if not nexts:
+                continue
+            yaw_diff = abs(_wrap_angle(
+                nexts[0].transform.rotation.yaw -
+                wp.transform.rotation.yaw
+            ))
+            if yaw_diff > self.cfg.CURVE_MIN_ANGLE:
+                curved.append(sp)
+
+        return curved, spawn_points
+
     def _spawn_vehicle(self):
         bp_lib = self.world.get_blueprint_library()
-        bp     = random.choice(bp_lib.filter("vehicle.tesla.model3"))
+        bp     = random.choice(
+            bp_lib.filter("vehicle.tesla.model3")
+        )
         if bp.has_attribute("color"):
             bp.set_attribute("color", "0,120,255")
 
-        spawn_points = self.carla_map.get_spawn_points()
-        random.shuffle(spawn_points)
+        curved_points, all_points = self._get_curve_spawn_points()
 
-        for sp in spawn_points[:self.cfg.SPAWN_RETRIES]:
+        if (curved_points and
+                np.random.rand() < self.cfg.CURVE_SPAWN_BIAS):
+            spawn_pool = curved_points
+        else:
+            spawn_pool = all_points
+
+        random.shuffle(spawn_pool)
+
+        for sp in spawn_pool[:self.cfg.SPAWN_RETRIES]:
             v = self.world.try_spawn_actor(bp, sp)
             if v is not None:
                 self.vehicle = v
@@ -309,7 +340,9 @@ class CarlaEnv(gym.Env):
 
     def _on_collision(self, event):
         self._collision_flag = True
-        logger.debug(f"[Env] Collision: {event.other_actor.type_id}")
+        logger.debug(
+            f"[Env] Collision: {event.other_actor.type_id}"
+        )
 
     # ==========================================================
     # TRAFFIC
@@ -338,12 +371,11 @@ class CarlaEnv(gym.Env):
         )
 
         self._cleanup()
-        self._load_map(map_name)
+        self._load_map(map_name or self._map_name)
 
         if not self._spawn_vehicle():
             raise RuntimeError("Could not spawn ego vehicle.")
 
-        # Warm up physics
         for _ in range(10):
             self.world.tick()
 
@@ -351,7 +383,7 @@ class CarlaEnv(gym.Env):
         self._configure_traffic_lights()
         self._spawn_traffic()
 
-        # Kickstart — vehicle moving before episode begins
+        # Kickstart
         for _ in range(15):
             self.vehicle.apply_control(carla.VehicleControl(
                 throttle = 0.5,
@@ -360,12 +392,10 @@ class CarlaEnv(gym.Env):
             ))
             self.world.tick()
 
-        # 🔥 Flush LiDAR queue — prevents FPS dip at episode start
+        # Flush LiDAR queue
         if self._lidar is not None:
-            flushed = self._lidar.flush()
-            logger.debug(f"[Env] LiDAR queue flushed ({flushed} frames)")
+            self._lidar.flush()
 
-        # Reset episode state
         self._collision_flag   = False
         self._offroad_flag     = False
         self._wrong_way_flag   = False
@@ -378,7 +408,6 @@ class CarlaEnv(gym.Env):
         self._obs_builder.reset(self.vehicle)
         self._reward_calc.reset()
 
-        # Warm up sensors
         for _ in range(5):
             self.world.tick()
 

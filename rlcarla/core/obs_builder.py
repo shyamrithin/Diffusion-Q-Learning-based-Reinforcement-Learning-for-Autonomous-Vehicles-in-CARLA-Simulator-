@@ -1,41 +1,13 @@
-# ==========================================================
-# rlcarla/core/obs_builder.py
-# 141D Fusion Observation Builder + 4-Frame Stack
-# Final OBS_DIM = 141 * 4 = 564
-# CARLA 0.9.16 compatible
-# ==========================================================
-
 import math
 import numpy as np
 import carla
 from collections import deque
 
 
-# ==========================================================
-# OBSERVATION LAYOUT (single frame = 141D)
-# ==========================================================
-#
-#  Component          Dims   Description
-#  ─────────────────────────────────────────────────────────
-#  ego_state            9    speed, vx, vy, yaw_rate,
-#                            steer, throttle, brake, ax, ay
-#  lane_info            4    signed_offset, yaw_error,
-#                            lane_width, is_junction
-#  traffic_state        2    is_red_light, speed_limit_norm
-#  lidar               72    polar histogram (5° bins)
-#  nearby_vehicles     20    4 vehicles × 5 features
-#  waypoints           34    17 future wps × (rel_x, rel_y)
-#  ─────────────────────────────────────────────────────────
-#  SINGLE FRAME       141
-#  STACKED (×4)       564    ← actual input to network
-#
-# ==========================================================
-
 SINGLE_OBS_DIM = 141
 N_STACK        = 4
 OBS_DIM        = SINGLE_OBS_DIM * N_STACK   # 564
 
-# Normalisation constants
 MAX_SPEED       = 15.0
 MAX_ACCEL       = 5.0
 MAX_YAW_RATE    = 90.0
@@ -51,21 +23,8 @@ N_WAYPOINTS     = 17
 WP_SPACING      = 3.0
 
 
-# ==========================================================
-# FRAME STACK
-# ==========================================================
 class FrameStack:
-    """
-    Maintains a rolling buffer of N_STACK frames.
-    Returns them concatenated as a single (OBS_DIM,) vector.
-
-    Why frame stacking?
-      A single frame gives the network no sense of motion —
-      it can't infer velocity, acceleration, or turning rate
-      from one snapshot. Stacking 4 frames (0.2 seconds of
-      history at 0.05s/tick) lets the network learn dynamics
-      without explicit recurrence (no LSTM needed).
-    """
+    """Rolling buffer of N_STACK frames concatenated."""
 
     def __init__(self, n_stack=N_STACK, obs_dim=SINGLE_OBS_DIM):
         self.n_stack = n_stack
@@ -73,41 +32,21 @@ class FrameStack:
         self._frames = deque(maxlen=n_stack)
 
     def reset(self, first_obs):
-        """Fill all frames with the first observation."""
         for _ in range(self.n_stack):
             self._frames.append(first_obs.copy())
         return self._get()
 
     def step(self, obs):
-        """Push new obs, return stacked vector."""
         self._frames.append(obs.copy())
         return self._get()
 
     def _get(self):
-        """Concatenate frames oldest → newest."""
-        return np.concatenate(list(self._frames), axis=0).astype(np.float32)
+        return np.concatenate(
+            list(self._frames), axis=0
+        ).astype(np.float32)
 
 
-# ==========================================================
-# OBSERVATION BUILDER
-# ==========================================================
 class ObservationBuilder:
-    """
-    Builds the 141D single-frame observation vector each step.
-    Frame stacking is handled by FrameStack above.
-
-    Usage:
-        builder = ObservationBuilder()
-        stack   = FrameStack()
-
-        # On reset:
-        raw_obs = builder.build(vehicle, carla_map, lidar, tm)
-        obs     = stack.reset(raw_obs)   # shape (564,)
-
-        # On step:
-        raw_obs = builder.build(vehicle, carla_map, lidar, tm)
-        obs     = stack.step(raw_obs)    # shape (564,)
-    """
 
     def __init__(self):
         self._prev_vel   = carla.Vector3D(0, 0, 0)
@@ -115,17 +54,12 @@ class ObservationBuilder:
         self._dt         = 0.05
 
     def reset(self, vehicle):
-        vel              = vehicle.get_velocity()
-        self._prev_vel   = vel
-        self._prev_yaw   = vehicle.get_transform().rotation.yaw
+        self._prev_vel = vehicle.get_velocity()
+        self._prev_yaw = vehicle.get_transform().rotation.yaw
 
-    def build(
-        self,
-        vehicle,
-        carla_map,
-        lidar_sensor,
-        traffic_manager = None,
-    ):
+    def build(self, vehicle, carla_map, lidar_sensor,
+              traffic_manager=None):
+
         obs = np.zeros(SINGLE_OBS_DIM, dtype=np.float32)
         ptr = 0
 
@@ -136,7 +70,7 @@ class ObservationBuilder:
         yaw     = tf.rotation.yaw
 
         # --------------------------------------------------
-        # 1. EGO STATE  (9D)
+        # 1. EGO STATE (9D)
         # --------------------------------------------------
         speed = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
 
@@ -149,27 +83,25 @@ class ObservationBuilder:
 
         dvx      = vel.x - self._prev_vel.x
         dvy      = vel.y - self._prev_vel.y
-        ax_world = dvx / self._dt
-        ay_world = dvy / self._dt
-        ax_local =  cos_y * ax_world + sin_y * ay_world
-        ay_local = -sin_y * ax_world + cos_y * ay_world
+        ax_local =  cos_y * (dvx/self._dt) + sin_y * (dvy/self._dt)
+        ay_local = -sin_y * (dvx/self._dt) + cos_y * (dvy/self._dt)
 
-        obs[ptr+0] = _clip_norm(speed,      MAX_SPEED)
-        obs[ptr+1] = _clip_norm(vx_local,   MAX_SPEED)
-        obs[ptr+2] = _clip_norm(vy_local,   MAX_SPEED)
-        obs[ptr+3] = _clip_norm(yaw_rate,   MAX_YAW_RATE)
+        obs[ptr+0] = _clip_norm(speed,    MAX_SPEED)
+        obs[ptr+1] = _clip_norm(vx_local, MAX_SPEED)
+        obs[ptr+2] = _clip_norm(vy_local, MAX_SPEED)
+        obs[ptr+3] = _clip_norm(yaw_rate, MAX_YAW_RATE)
         obs[ptr+4] = float(control.steer)
         obs[ptr+5] = float(control.throttle)
         obs[ptr+6] = float(control.brake)
-        obs[ptr+7] = _clip_norm(ax_local,   MAX_ACCEL)
-        obs[ptr+8] = _clip_norm(ay_local,   MAX_ACCEL)
+        obs[ptr+7] = _clip_norm(ax_local, MAX_ACCEL)
+        obs[ptr+8] = _clip_norm(ay_local, MAX_ACCEL)
         ptr += 9
 
         self._prev_vel = vel
         self._prev_yaw = yaw
 
         # --------------------------------------------------
-        # 2. LANE INFO  (4D)
+        # 2. LANE INFO (4D)
         # --------------------------------------------------
         wp = carla_map.get_waypoint(
             loc,
@@ -201,12 +133,13 @@ class ObservationBuilder:
         ptr += 4
 
         # --------------------------------------------------
-        # 3. TRAFFIC STATE  (2D)
+        # 3. TRAFFIC STATE (2D)
         # --------------------------------------------------
         tl_state         = vehicle.get_traffic_light_state()
-        is_red           = float(tl_state == carla.TrafficLightState.Red)
-        speed_limit_raw  = vehicle.get_speed_limit()
-        speed_limit_ms   = speed_limit_raw / 3.6
+        is_red           = float(
+            tl_state == carla.TrafficLightState.Red
+        )
+        speed_limit_ms   = vehicle.get_speed_limit() / 3.6
         speed_limit_norm = _clip_norm(speed_limit_ms, MAX_SPEED_LIMIT)
 
         obs[ptr+0] = is_red
@@ -214,14 +147,14 @@ class ObservationBuilder:
         ptr += 2
 
         # --------------------------------------------------
-        # 4. LIDAR HISTOGRAM  (72D)
+        # 4. LIDAR HISTOGRAM (72D)
         # --------------------------------------------------
         histogram       = lidar_sensor.get_histogram()
         obs[ptr:ptr+72] = histogram
         ptr += 72
 
         # --------------------------------------------------
-        # 5. NEARBY VEHICLES  (20D = 4 × 5)
+        # 5. NEARBY VEHICLES (20D)
         # --------------------------------------------------
         if traffic_manager is not None:
             nearby = traffic_manager.get_nearby_vehicles(
@@ -248,23 +181,23 @@ class ObservationBuilder:
         ptr += N_NEARBY * 5
 
         # --------------------------------------------------
-        # 6. FUTURE WAYPOINTS  (34D = 17 × 2)
+        # 6. FUTURE WAYPOINTS (34D) — SAME LANE ENFORCED
         # --------------------------------------------------
-        future_wps = _get_future_waypoints(
+        future_wps = _get_future_waypoints_same_lane(
             loc, yaw, wp, N_WAYPOINTS, WP_SPACING
         )
 
         for i in range(N_WAYPOINTS):
             base = ptr + i * 2
             if i < len(future_wps):
-                rx, ry        = future_wps[i]
-                obs[base+0]   = _clip_norm(rx, MAX_WP_DIST)
-                obs[base+1]   = _clip_norm(ry, MAX_WP_DIST)
+                rx, ry      = future_wps[i]
+                obs[base+0] = _clip_norm(rx, MAX_WP_DIST)
+                obs[base+1] = _clip_norm(ry, MAX_WP_DIST)
             else:
-                obs[base+0]   = _clip_norm(
-                    (i + 1) * WP_SPACING, MAX_WP_DIST
+                obs[base+0] = _clip_norm(
+                    (i+1) * WP_SPACING, MAX_WP_DIST
                 )
-                obs[base+1]   = 0.0
+                obs[base+1] = 0.0
         ptr += N_WAYPOINTS * 2
 
         assert ptr == SINGLE_OBS_DIM, \
@@ -291,7 +224,14 @@ def _wrap_angle(angle):
     return angle
 
 
-def _get_future_waypoints(ego_loc, ego_yaw, start_wp, n, spacing):
+def _get_future_waypoints_same_lane(
+    ego_loc, ego_yaw, start_wp, n, spacing
+):
+    """
+    Walk n waypoints ahead staying in the SAME lane.
+    Never switches lanes at intersections.
+    This is the key to single-lane following behaviour.
+    """
     if start_wp is None:
         return []
 
@@ -299,17 +239,32 @@ def _get_future_waypoints(ego_loc, ego_yaw, start_wp, n, spacing):
     sin_y     = math.sin(math.radians(ego_yaw))
     waypoints = []
     current   = start_wp
+    target_lane_id = start_wp.lane_id
 
     for _ in range(n):
         nexts = current.next(spacing)
         if not nexts:
             break
-        current = nexts[0]
-        loc     = current.transform.location
-        dx      = loc.x - ego_loc.x
-        dy      = loc.y - ego_loc.y
-        rel_x   =  cos_y * dx + sin_y * dy
-        rel_y   = -sin_y * dx + cos_y * dy
+
+        # 🔥 Enforce same lane — filter by lane_id
+        same_lane = [
+            wp for wp in nexts
+            if wp.lane_id == target_lane_id
+        ]
+
+        if same_lane:
+            current = same_lane[0]
+        else:
+            # At intersection or lane end — take first option
+            # but update target lane id to follow through
+            current = nexts[0]
+            target_lane_id = current.lane_id
+
+        loc   = current.transform.location
+        dx    = loc.x - ego_loc.x
+        dy    = loc.y - ego_loc.y
+        rel_x =  cos_y * dx + sin_y * dy
+        rel_y = -sin_y * dx + cos_y * dy
         waypoints.append((rel_x, rel_y))
 
     return waypoints
