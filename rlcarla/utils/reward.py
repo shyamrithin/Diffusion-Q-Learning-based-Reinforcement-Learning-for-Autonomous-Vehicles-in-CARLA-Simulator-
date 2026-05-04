@@ -1,15 +1,36 @@
+# ==========================================================
+# rlcarla/utils/reward.py
+# Multi-Phase Reward System v3
+#
+# Changes in this version:
+#   - Reward clipping prep (values bounded by design)
+#   - Curve reward scaled by sharpness (sharper = more reward)
+#   - Forward progress halved on curves (turning > speed)
+#   - Yaw penalty doubled on curves
+#   - LiDAR proximity penalty (Option C — proactive avoidance)
+#   - Proximity brake reward (agent learns to slow early)
+#   - Single lane dominant signals
+#   - Red light via CARLA API (no camera needed)
+#   - All weights in W dict — tune without touching logic
+#
+# CARLA 0.9.16 compatible
+# ==========================================================
+
 import math
 import numpy as np
 import carla
 
+# ==========================================================
+# REWARD WEIGHTS — tune here, don't touch logic below
+# ==========================================================
 W = {
     # Core locomotion
-    "forward_progress"    :  1.0,   # reduced — lane discipline dominant
+    "forward_progress"    :  1.0,   # reduced — lane dominant
     "raw_speed"           :  0.2,
     "speed_target"        :  1.0,
 
     # Lane discipline — PRIMARY signals
-    "lane_center"         :  2.5,   # most important
+    "lane_center"         :  2.5,
     "lane_offset_penalty" :  6.0,
     "yaw_align"           :  2.0,
     "yaw_penalty"         :  8.0,
@@ -28,13 +49,13 @@ W = {
     # Safety
     "collision"           : 50.0,
     "off_road"            : 20.0,
-    "wrong_lane"          : 40.0,   # very high — single lane critical
+    "wrong_lane"          : 40.0,
     "wrong_way"           : 30.0,
     "stuck"               :  0.5,
 
-    # Proactive collision avoidance — LiDAR proximity
-    "proximity_penalty"   :  8.0,   # scales with closeness
-    "proximity_brake"     :  2.0,   # reward for braking near obstacle
+    # Proactive collision avoidance (LiDAR)
+    "proximity_penalty"   :  8.0,
+    "proximity_brake"     :  2.0,
 
     # Traffic compliance
     "red_light_penalty"   : 25.0,
@@ -47,32 +68,31 @@ W = {
 # Thresholds
 SPEED_TARGET_MIN      = 3.0
 SPEED_TARGET_MAX      = 9.0
-LANE_OFFSET_OK        = 0.2    # very tight — was 0.3
-LANE_OFFSET_BAD       = 0.5    # was 0.8
+LANE_OFFSET_OK        = 0.2
+LANE_OFFSET_BAD       = 0.5
 YAW_OK_DEG            = 8.0
 YAW_BAD_DEG           = 35.0
 CURVE_ANGLE_THRESHOLD = 8.0
 STUCK_SPEED_MS        = 0.5
 
-# LiDAR proximity thresholds
-# LiDAR range = 30m, normalised 0-1
-# 0.3 = 9m, 0.2 = 6m, 0.1 = 3m
-PROXIMITY_WARN   = 0.3   # 9m — start penalising
-PROXIMITY_DANGER = 0.15  # 4.5m — strong penalty
-PROXIMITY_CRITICAL = 0.08  # 2.4m — near collision
+# LiDAR proximity thresholds (normalised 0-1, range=30m)
+PROXIMITY_WARN     = 0.30   # 9m
+PROXIMITY_DANGER   = 0.15   # 4.5m
+PROXIMITY_CRITICAL = 0.08   # 2.4m
 
-# LiDAR obs indices in 141D single frame
-LIDAR_START = 15
-LIDAR_END   = 87
-
-# Forward-facing bins (±15° = bins 0,1,2 and 70,71)
-FORWARD_BINS = [0, 1, 2, 70, 71]
-# Side bins for lane change detection
-LEFT_BINS    = [17, 18, 19]   # ~90° left
-RIGHT_BINS   = [53, 54, 55]   # ~90° right
+# LiDAR slice indices in 141D single-frame obs
+LIDAR_START   = 15
+LIDAR_END     = 87
+FORWARD_BINS  = [0, 1, 2, 70, 71]   # ±15° forward
 
 
+# ==========================================================
 class RewardCalculator:
+    """
+    Stateful reward calculator.
+    Must call reset() at episode start.
+    Tracks previous actions for jerk penalties.
+    """
 
     def __init__(self):
         self.prev_steer           = 0.0
@@ -83,6 +103,7 @@ class RewardCalculator:
         self._red_light_penalised = False
 
     def reset(self):
+        """Reset per-episode state."""
         self.prev_steer           = 0.0
         self.prev_throttle        = 0.0
         self.prev_brake           = 0.0
@@ -100,6 +121,21 @@ class RewardCalculator:
         wrong_way  = False,
         wrong_lane = False,
     ):
+        """
+        Compute full reward for one step.
+
+        Args:
+            vehicle    : carla.Vehicle actor
+            carla_map  : carla.Map
+            obs        : 564D stacked observation
+            action     : [throttle, steer, brake]
+            collision  : bool from collision sensor
+            wrong_way  : bool from yaw diff check
+            wrong_lane : bool from lane_id check
+
+        Returns:
+            (reward: float, info: dict)
+        """
         reward = 0.0
         info   = {}
 
@@ -155,20 +191,18 @@ class RewardCalculator:
         )
         is_curve = max_curve_angle > CURVE_ANGLE_THRESHOLD
 
-        # Extract LiDAR from obs
-        # obs is 564D stacked — first frame lidar is at
-        # LIDAR_START:LIDAR_END
+        # Extract LiDAR from stacked obs (first frame)
         lidar = obs[LIDAR_START:LIDAR_END]
 
         # --------------------------------------------------
-        # 1. ALIVE
+        # 1. ALIVE BONUS
         # --------------------------------------------------
         reward += W["alive"]
         info["alive"] = W["alive"]
 
         # --------------------------------------------------
         # 2. FORWARD PROGRESS
-        # Scaled down on curves
+        # Halved on curves — turning more important than speed
         # --------------------------------------------------
         progress_scale = 0.5 if is_curve else 1.0
         r_progress = (
@@ -180,8 +214,9 @@ class RewardCalculator:
         # --------------------------------------------------
         # 3. SPEED REGULATION
         # --------------------------------------------------
-        reward += speed * W["raw_speed"]
-        info["raw_speed"] = speed * W["raw_speed"]
+        r_speed = speed * W["raw_speed"]
+        reward += r_speed
+        info["raw_speed"] = r_speed
 
         if SPEED_TARGET_MIN <= speed <= SPEED_TARGET_MAX:
             reward += W["speed_target"]
@@ -218,7 +253,7 @@ class RewardCalculator:
 
         # --------------------------------------------------
         # 5. YAW ALIGNMENT
-        # Double weight on curves
+        # Double weight on curves — heading critical
         # --------------------------------------------------
         abs_yaw    = abs(yaw_error)
         yaw_weight = 2.0 if is_curve else 1.0
@@ -226,7 +261,10 @@ class RewardCalculator:
         if abs_yaw < YAW_OK_DEG:
             r_yaw = W["yaw_align"] * yaw_weight
         elif abs_yaw < YAW_BAD_DEG:
-            frac  = (abs_yaw - YAW_OK_DEG) / (YAW_BAD_DEG - YAW_OK_DEG)
+            frac  = (
+                (abs_yaw - YAW_OK_DEG) /
+                (YAW_BAD_DEG - YAW_OK_DEG)
+            )
             r_yaw = W["yaw_align"] * (1.0 - frac) * yaw_weight
         else:
             r_yaw = -W["yaw_penalty"] * yaw_weight
@@ -236,6 +274,7 @@ class RewardCalculator:
 
         # --------------------------------------------------
         # 6. CURVE FOLLOWING
+        # Reward/penalty scaled by curve sharpness
         # --------------------------------------------------
         if is_curve:
             steer_in_curve_dir = (np.sign(steer) == curve_sign)
@@ -264,11 +303,17 @@ class RewardCalculator:
             info["curve"]        = "straight"
 
         # --------------------------------------------------
-        # 7. SMOOTHNESS
+        # 7. SMOOTHNESS + COMFORT
         # --------------------------------------------------
-        r_steer_jerk    = -abs(steer - self.prev_steer) * W["steer_jerk"]
-        r_throttle_jerk = -abs(throttle - self.prev_throttle) * W["throttle_jerk"]
-        r_brake_jerk    = -abs(brake - self.prev_brake) * W["brake_jerk"]
+        r_steer_jerk    = (
+            -abs(steer - self.prev_steer) * W["steer_jerk"]
+        )
+        r_throttle_jerk = (
+            -abs(throttle - self.prev_throttle) * W["throttle_jerk"]
+        )
+        r_brake_jerk    = (
+            -abs(brake - self.prev_brake) * W["brake_jerk"]
+        )
 
         reward += r_steer_jerk + r_throttle_jerk + r_brake_jerk
         info["steer_jerk"]    = r_steer_jerk
@@ -337,41 +382,35 @@ class RewardCalculator:
             info["collision"] = 0.0
 
         # --------------------------------------------------
-        # 13. PROACTIVE COLLISION AVOIDANCE — LiDAR proximity
-        # Option C: both proximity penalty + brake reward
+        # 13. PROACTIVE COLLISION AVOIDANCE — Option C
+        # LiDAR proximity penalty (reactive before impact)
+        # + Brake reward (proactive slowing)
         # --------------------------------------------------
         forward_min = float(np.min(lidar[FORWARD_BINS]))
 
         if forward_min < PROXIMITY_CRITICAL:
-            # Very close — heavy penalty
-            r_proximity = -W["proximity_penalty"] * (
+            r_proximity        = -W["proximity_penalty"] * (
                 (PROXIMITY_WARN - forward_min) / PROXIMITY_WARN
             ) * 3.0
-            info["proximity"] = "critical"
-
+            info["proximity"]  = "critical"
         elif forward_min < PROXIMITY_DANGER:
-            # Getting close — medium penalty
-            r_proximity = -W["proximity_penalty"] * (
+            r_proximity        = -W["proximity_penalty"] * (
                 (PROXIMITY_WARN - forward_min) / PROXIMITY_WARN
             ) * 1.5
-            info["proximity"] = "danger"
-
+            info["proximity"]  = "danger"
         elif forward_min < PROXIMITY_WARN:
-            # Obstacle detected — light penalty
-            r_proximity = -W["proximity_penalty"] * (
+            r_proximity        = -W["proximity_penalty"] * (
                 (PROXIMITY_WARN - forward_min) / PROXIMITY_WARN
             )
-            info["proximity"] = "warn"
-
+            info["proximity"]  = "warn"
         else:
-            r_proximity = 0.0
-            info["proximity"] = "clear"
+            r_proximity        = 0.0
+            info["proximity"]  = "clear"
 
         reward += r_proximity
         info["proximity_reward"] = r_proximity
 
-        # Reward for braking when obstacle is close
-        # Agent learns to slow down proactively
+        # Reward braking when obstacle close
         if forward_min < PROXIMITY_WARN and brake > 0.2:
             r_brake = W["proximity_brake"] * brake * (
                 1.0 - forward_min / PROXIMITY_WARN
@@ -383,6 +422,7 @@ class RewardCalculator:
 
         # --------------------------------------------------
         # 14. RED LIGHT — CARLA API
+        # Only penalises once per red light encounter
         # --------------------------------------------------
         tl_state = vehicle.get_traffic_light_state()
         at_red   = (tl_state == carla.TrafficLightState.Red)
@@ -398,7 +438,7 @@ class RewardCalculator:
             info["red_light"] = 0.0
 
         # --------------------------------------------------
-        # UPDATE PREV
+        # UPDATE PREVIOUS ACTION STATE
         # --------------------------------------------------
         self.prev_steer    = steer
         self.prev_throttle = throttle
@@ -408,13 +448,22 @@ class RewardCalculator:
         return float(reward), info
 
 
+# ==========================================================
+# HELPERS
+# ==========================================================
+
 def _wrap_angle(angle):
+    """Wrap angle to [-180, 180] degrees."""
     while angle >  180: angle -= 360
     while angle < -180: angle += 360
     return angle
 
 
 def _get_future_angles(wp, vehicle_yaw, steps=5, dist=4.0):
+    """
+    Walk steps waypoints ahead and return list of signed
+    relative yaw angles. Positive = curve right.
+    """
     angles  = []
     current = wp
     for _ in range(steps):

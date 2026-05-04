@@ -1,3 +1,23 @@
+# ==========================================================
+# train_diffusion.py
+# RLCarla Training Script v4
+#
+# Changes in this version:
+#   - Critic reset on resume (keep actor, fresh critic)
+#     Fixes critic divergence from previous run
+#   - Reward clipping in replay buffer [-10, 10]
+#     Prevents Q-value explosion
+#   - Much lower LR (3e-5) and grad norm (0.1)
+#     More stable critic training
+#   - Lower ETA (0.001) — minimal Q-learning pressure
+#   - Higher TRAIN_FREQ (6) — less aggressive updates
+#   - Square LiDAR panel, every frame (no flicker)
+#   - Episode counter shows (+new) from resume point
+#   - Town03 single map, curriculum traffic
+#
+# CARLA 0.9.16 | Gymnasium 1.3 | Python 3.10
+# ==========================================================
+
 import os
 import time
 import traceback
@@ -14,8 +34,11 @@ import carla
 
 from torch.utils.tensorboard  import SummaryWriter
 from agents.ql_diffusion       import Diffusion_QL
+from agents.ql_diffusion       import Critic
 from rlcarla.core.obs_builder  import OBS_DIM
-from rlcarla.utils.trajectory  import draw_trajectory, get_future_waypoints
+from rlcarla.utils.trajectory  import (
+    draw_trajectory, get_future_waypoints
+)
 
 logging.basicConfig(
     level   = logging.INFO,
@@ -31,19 +54,28 @@ torch.set_float32_matmul_precision("medium")
 # TRAIN CONFIG
 # ==========================================================
 class TrainConfig:
+    """
+    All training hyperparameters in one place.
+
+    Key changes from v3:
+      LR        : 1e-4  → 3e-5  (critic stability)
+      GRAD_NORM : 0.5   → 0.1   (tighter clipping)
+      ETA       : 0.005 → 0.001 (less Q pressure)
+      TRAIN_FREQ: 4     → 6     (less aggressive)
+    """
 
     WIDTH          = 800
     HEIGHT         = 450
     FPS            = 20
 
-    MAX_EPISODES          = 1600
+    MAX_EPISODES          = 2000   # resume runs to here
     MAX_STEPS             = 1000
 
     START_RANDOM_STEPS    = 10000
     POLICY_RANDOM_MIX     = 0.15
 
     BATCH_SIZE            = 256
-    TRAIN_FREQ            = 4
+    TRAIN_FREQ            = 6      # was 4
     SAVE_EVERY            = 10
 
     BUFFER_SIZE           = 200000
@@ -51,13 +83,14 @@ class TrainConfig:
 
     DISCOUNT              = 0.99
     TAU                   = 0.005
-    ETA                   = 0.005
+    ETA                   = 0.001  # was 0.005
     BETA_SCHEDULE         = "vp"
     N_TIMESTEPS           = 3
-    LR                    = 1e-4
-    GRAD_NORM             = 0.5
+    LR                    = 3e-5   # was 1e-4
+    GRAD_NORM             = 0.1    # was 0.5
     ACTION_TEMPERATURE    = 0.1
 
+    # Curriculum — traffic increases with episodes
     CURRICULUM = [
         (0,    "empty"),
         (100,  "light"),
@@ -65,6 +98,7 @@ class TrainConfig:
         (350,  "heavy"),
     ]
 
+    # Traffic lights off until episode 200
     TRAFFIC_LIGHT_CURRICULUM = [
         (0,   "off"),
         (200, "on"),
@@ -84,6 +118,10 @@ cfg = TrainConfig()
 # RESUME HELPER
 # ==========================================================
 def find_latest_checkpoint(checkpoint_dir):
+    """
+    Find the latest numbered checkpoint (excluding 9999).
+    Returns (episode_number, dir) or (0, None).
+    """
     if not os.path.exists(checkpoint_dir):
         return 0, None
 
@@ -103,11 +141,14 @@ def find_latest_checkpoint(checkpoint_dir):
     if not episodes:
         return 0, None
 
-    latest_ep = max(episodes)
-    return latest_ep, checkpoint_dir
+    return max(episodes), checkpoint_dir
 
 
 def resume_training(agent, checkpoint_dir):
+    """
+    Load latest checkpoint and return starting episode.
+    Falls back to best model (9999) if no numbered ones.
+    """
     latest_ep, path = find_latest_checkpoint(checkpoint_dir)
 
     if latest_ep > 0:
@@ -127,10 +168,40 @@ def resume_training(agent, checkpoint_dir):
     return 0
 
 
+def reset_critic(agent, device, lr):
+    """
+    Reset critic to fresh weights while keeping actor.
+
+    Why: Critic diverged in previous run (loss → 6000+).
+    The actor (diffusion BC) learned useful behaviour
+    but the critic's corrupted Q-values poisoned policy
+    gradient. Fresh critic + lower LR = stable training.
+
+    Actor weights are KEPT — turning knowledge preserved.
+    """
+    agent.critic        = Critic(OBS_DIM, 3).to(device)
+    agent.critic_target = Critic(OBS_DIM, 3).to(device)
+    agent.critic_target.load_state_dict(
+        agent.critic.state_dict()
+    )
+    agent.critic_optimizer = torch.optim.Adam(
+        agent.critic.parameters(), lr=lr
+    )
+    logger.info(
+        "Critic reset — actor weights preserved. "
+        "Fresh Q-networks with LR={lr}"
+    )
+
+
 # ==========================================================
 # REPLAY BUFFER
 # ==========================================================
 class ReplayBuffer:
+    """
+    Experience replay buffer.
+    Stores (s, a, s', r, not_done) tuples.
+    Reward clipping to [-10, 10] prevents Q-value explosion.
+    """
 
     def __init__(self, state_dim, action_dim, max_size):
         self.max_size   = max_size
@@ -149,6 +220,9 @@ class ReplayBuffer:
         self.not_done   = np.zeros((max_size, 1), dtype=np.float32)
 
     def add(self, s, a, ns, r, done):
+        # 🔥 Clip reward — prevents Q-value explosion
+        r = float(np.clip(r, -10.0, 10.0))
+
         self.state[self.ptr]      = s
         self.action[self.ptr]     = a
         self.next_state[self.ptr] = ns
@@ -175,6 +249,10 @@ class ReplayBuffer:
 # EXPLORATION
 # ==========================================================
 def random_action():
+    """
+    Biased random action for exploration.
+    Never brakes — ensures vehicle moves during warmup.
+    """
     throttle = np.random.uniform(0.5, 0.85)
     steer    = np.random.uniform(-0.25, 0.25)
     brake    = 0.0
@@ -182,12 +260,24 @@ def random_action():
 
 
 def smooth_action(raw_action, prev_action, alpha=cfg.ACTION_ALPHA):
+    """
+    Blend policy output with previous action.
+    alpha=0.7 → 70% new + 30% previous.
+    Removes high-frequency steering jitter.
+    Only applied to policy actions, not random ones.
+    """
     return (
         alpha * raw_action + (1.0 - alpha) * prev_action
     ).astype(np.float32)
 
 
 def choose_action(agent, state, prev_action, total_steps):
+    """
+    Action selection strategy:
+      < START_RANDOM_STEPS : pure random (no smoothing)
+      POLICY_RANDOM_MIX    : random injection (no smoothing)
+      otherwise            : policy + smoothing
+    """
     if total_steps < cfg.START_RANDOM_STEPS:
         return random_action()
     if np.random.rand() < cfg.POLICY_RANDOM_MIX:
@@ -205,6 +295,7 @@ def choose_action(agent, state, prev_action, total_steps):
 # CURRICULUM
 # ==========================================================
 def get_traffic_preset(episode):
+    """Return traffic preset for current episode."""
     preset = "empty"
     for ep_thresh, p in cfg.CURRICULUM:
         if episode >= ep_thresh:
@@ -213,6 +304,7 @@ def get_traffic_preset(episode):
 
 
 def get_traffic_lights(episode):
+    """Return traffic light mode for current episode."""
     mode = "off"
     for ep_thresh, m in cfg.TRAFFIC_LIGHT_CURRICULUM:
         if episode >= ep_thresh:
@@ -221,17 +313,23 @@ def get_traffic_lights(episode):
 
 
 # ==========================================================
-# 3D LIDAR — SQUARE PANEL, NO FLICKER
+# 3D LIDAR VISUALIZER — Square panel, no flicker
 # ==========================================================
 def draw_point_cloud(screen, points, center_x, center_y,
                      size=180, max_range=30.0):
     """
-    Square LiDAR point cloud display.
-    Renders every frame — no flickering.
+    Render 3D LiDAR point cloud as square top-down panel.
+    Points colored by height (z):
+      Dark grey  → ground      (z < -1.5m)
+      Grey       → near ground (-1.5 to -0.5m)
+      Green      → vehicle lvl (-0.5 to  0.5m)
+      Orange     → obstacle    ( 0.5 to  1.5m)
+      Blue       → tall object (> 1.5m)
+    Renders every frame — no % 2 skip (fixes flicker).
     """
     font_s = pygame.font.SysFont("monospace", 10)
 
-    # Square background
+    # Semi-transparent square background
     bg = pygame.Surface((size, size), pygame.SRCALPHA)
     bg.fill((0, 0, 0, 175))
     screen.blit(bg, (center_x - size//2, center_y - size//2))
@@ -239,58 +337,53 @@ def draw_point_cloud(screen, points, center_x, center_y,
     # Border
     pygame.draw.rect(
         screen, (0, 130, 0),
-        (center_x - size//2, center_y - size//2, size, size),
-        1
+        (center_x-size//2, center_y-size//2, size, size), 1
     )
 
     # Center crosshairs
     pygame.draw.line(
         screen, (0, 40, 0),
-        (center_x - size//2, center_y),
-        (center_x + size//2, center_y), 1
+        (center_x-size//2, center_y),
+        (center_x+size//2, center_y), 1
     )
     pygame.draw.line(
         screen, (0, 40, 0),
-        (center_x, center_y - size//2),
-        (center_x, center_y + size//2), 1
+        (center_x, center_y-size//2),
+        (center_x, center_y+size//2), 1
     )
 
-    # Quarter grid lines
+    # Quarter grid
     for offset in [-size//4, size//4]:
         pygame.draw.line(
             screen, (0, 25, 0),
-            (center_x - size//2, center_y + offset),
-            (center_x + size//2, center_y + offset), 1
+            (center_x-size//2, center_y+offset),
+            (center_x+size//2, center_y+offset), 1
         )
         pygame.draw.line(
             screen, (0, 25, 0),
-            (center_x + offset, center_y - size//2),
-            (center_x + offset, center_y + size//2), 1
+            (center_x+offset, center_y-size//2),
+            (center_x+offset, center_y+size//2), 1
         )
 
     # Forward arrow
-    pygame.draw.polygon(
-        screen, (0, 255, 100),
-        [
-            (center_x,     center_y - size//2 - 7),
-            (center_x - 4, center_y - size//2 + 1),
-            (center_x + 4, center_y - size//2 + 1),
-        ]
-    )
+    pygame.draw.polygon(screen, (0, 255, 100), [
+        (center_x,     center_y-size//2-7),
+        (center_x-4,   center_y-size//2+1),
+        (center_x+4,   center_y-size//2+1),
+    ])
 
     # Range labels
     lbl_30 = font_s.render("30m", True, (0, 90, 0))
     lbl_15 = font_s.render("15m", True, (0, 70, 0))
-    screen.blit(lbl_30, (center_x + 3, center_y - size//2 + 2))
-    screen.blit(lbl_15, (center_x + 3, center_y - size//4 + 2))
+    screen.blit(lbl_30, (center_x+3, center_y-size//2+2))
+    screen.blit(lbl_15, (center_x+3, center_y-size//4+2))
 
     # Draw points
     if len(points) > 0:
-        scale = (size // 2) / max_range
-        x_pts = points[:, 0]
-        y_pts = points[:, 1]
-        z_pts = points[:, 2]
-
+        scale = (size//2) / max_range
+        x_pts = points[:,0]
+        y_pts = points[:,1]
+        z_pts = points[:,2]
         dist  = np.sqrt(x_pts**2 + y_pts**2)
         mask  = (dist > 0.5) & (dist < max_range)
         x_pts = x_pts[mask]
@@ -301,11 +394,8 @@ def draw_point_cloud(screen, points, center_x, center_y,
             rx = int(center_x - y_pts[i] * scale)
             ry = int(center_y - x_pts[i] * scale)
 
-            # Clip to square boundary
-            if (rx < center_x - size//2 or
-                    rx > center_x + size//2 or
-                    ry < center_y - size//2 or
-                    ry > center_y + size//2):
+            if (rx < center_x-size//2 or rx > center_x+size//2 or
+                    ry < center_y-size//2 or ry > center_y+size//2):
                 continue
 
             pz = z_pts[i]
@@ -317,7 +407,7 @@ def draw_point_cloud(screen, points, center_x, center_y,
 
             pygame.draw.circle(screen, color, (rx, ry), 2)
 
-    # Ego dot
+    # Ego vehicle dot
     pygame.draw.circle(
         screen, (0, 200, 255), (center_x, center_y), 5
     )
@@ -328,11 +418,11 @@ def draw_point_cloud(screen, points, center_x, center_y,
     # Title
     title = font_s.render("LiDAR 3D", True, (0, 200, 0))
     screen.blit(title, (
-        center_x - title.get_width() // 2,
+        center_x - title.get_width()//2,
         center_y + size//2 + 4
     ))
 
-    # Height legend inside bottom left
+    # Height legend inside bottom-left
     legend = [
         ((50,  50,  50),  "gnd"),
         ((100, 100, 100), "low"),
@@ -355,7 +445,10 @@ def draw_point_cloud(screen, points, center_x, center_y,
 def draw_hud(screen, font, info, total_steps, episode,
              ep_reward, replay_size, traffic_preset,
              tl_mode, view, start_episode):
-
+    """
+    Semi-transparent HUD overlay.
+    Shows (+N) new episodes since resume point.
+    """
     lines = [
         f"Episode     : {episode} (+{episode-start_episode})",
         f"Step        : {info.get('step', 0)}",
@@ -385,7 +478,7 @@ def draw_hud(screen, font, info, total_steps, episode,
 # ==========================================================
 pygame.init()
 screen = pygame.display.set_mode((cfg.WIDTH, cfg.HEIGHT))
-pygame.display.set_caption("RLCarla Training v3")
+pygame.display.set_caption("RLCarla Training v4")
 clock  = pygame.time.Clock()
 font   = pygame.font.SysFont("monospace", 16)
 
@@ -415,9 +508,13 @@ agent = Diffusion_QL(
 )
 
 # ==========================================================
-# RESUME
+# RESUME + CRITIC RESET
 # ==========================================================
 start_episode = resume_training(agent, cfg.CHECKPOINT_DIR)
+
+# Reset critic — keep actor weights, fresh Q-networks
+# This fixes the critic divergence from previous run
+reset_critic(agent, cfg.DEVICE, cfg.LR)
 
 replay       = ReplayBuffer(OBS_DIM, 3, cfg.BUFFER_SIZE)
 best_reward  = -1e9
@@ -428,10 +525,12 @@ logger.info(f"Device        : {cfg.DEVICE}")
 logger.info(f"Obs dim       : {OBS_DIM}")
 logger.info(f"Start episode : {start_episode}")
 logger.info(f"Target end    : {cfg.MAX_EPISODES}")
-logger.info(f"New episodes  : ~{cfg.MAX_EPISODES - start_episode}")
-logger.info(f"LR            : {cfg.LR}")
-logger.info(f"Train freq    : {cfg.TRAIN_FREQ}")
+logger.info(f"New episodes  : ~{cfg.MAX_EPISODES-start_episode}")
+logger.info(f"LR            : {cfg.LR} (reduced for stability)")
 logger.info(f"Grad norm     : {cfg.GRAD_NORM}")
+logger.info(f"Train freq    : {cfg.TRAIN_FREQ}")
+logger.info(f"Reward clip   : [-10, 10]")
+logger.info(f"Critic        : RESET (actor weights kept)")
 
 # ==========================================================
 # TRAINING LOOP
@@ -461,6 +560,7 @@ try:
 
         for step in range(cfg.MAX_STEPS):
 
+            # Pygame events
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -469,6 +569,7 @@ try:
             if keys[pygame.K_ESCAPE]:
                 running = False
 
+            # Camera switching
             if keys[pygame.K_1]:
                 current_view = "third_person"
                 env.unwrapped.set_camera_view(current_view)
@@ -482,6 +583,7 @@ try:
                 current_view = "bird_eye"
                 env.unwrapped.set_camera_view(current_view)
 
+            # Spectator mode
             if keys[pygame.K_5]:
                 env.unwrapped.set_spectator_mode("follow")
             elif keys[pygame.K_6]:
@@ -492,6 +594,7 @@ try:
             if not running:
                 break
 
+            # Action selection
             action = choose_action(
                 agent, state, prev_action, total_steps
             )
@@ -506,6 +609,7 @@ try:
             total_steps += 1
             ep_info     = info
 
+            # Training step
             if (len(replay) > cfg.BATCH_SIZE and
                     total_steps % cfg.TRAIN_FREQ == 0):
 
@@ -519,7 +623,7 @@ try:
                 ep_ql_loss.append(np.mean(metric["ql_loss"]))
                 ep_cr_loss.append(np.mean(metric["critic_loss"]))
 
-            # ---- Render camera ----
+            # Camera frame + trajectory overlay
             frame = env.unwrapped.get_camera_frame()
 
             if frame is not None:
@@ -542,7 +646,7 @@ try:
                 )
                 screen.blit(surf, (0, 0))
 
-            # ---- HUD ----
+            # HUD
             draw_hud(
                 screen, font, ep_info,
                 total_steps, episode, ep_reward,
@@ -550,7 +654,7 @@ try:
                 tl_mode, current_view, start_episode,
             )
 
-            # ---- LiDAR — every frame, square panel ----
+            # LiDAR point cloud — every frame, square panel
             if env.unwrapped._lidar is not None:
                 points = env.unwrapped._lidar.get_points()
                 draw_point_cloud(
@@ -567,7 +671,7 @@ try:
             if done or trunc:
                 break
 
-        # ---- Logging ----
+        # Episode logging
         writer.add_scalar("reward/episode",     ep_reward, episode)
         writer.add_scalar("reward/total_steps", ep_reward, total_steps)
         writer.add_scalar("env/episode_length", step+1,    episode)
@@ -584,6 +688,7 @@ try:
             "forward_progress", "lane_center", "yaw_align",
             "curve_reward", "collision", "off_road", "stuck",
             "red_light", "wrong_lane", "wrong_way", "comfort",
+            "proximity_reward",
         ]:
             if key in ep_info:
                 writer.add_scalar(

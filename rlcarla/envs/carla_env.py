@@ -1,3 +1,21 @@
+# ==========================================================
+# rlcarla/envs/carla_env.py
+# RLCarla Main Environment — Full Restructure v3
+#
+# Changes in this version:
+#   - Intersection false-positive offroad fix
+#     (CARLA returns None at junctions even on valid road)
+#   - Curve-biased spawning (60% near curves)
+#   - Same-lane waypoint following
+#   - Wrong-lane strict enforcement (3 step limit)
+#   - Town03 single map for curve training
+#   - Trajectory overlay (white centerline + green kinematic)
+#   - LiDAR queue flush on reset (no FPS dip)
+#   - Kickstart on reset (vehicle moving from step 1)
+#
+# CARLA 0.9.16 | Gymnasium 1.3 | Python 3.10
+# ==========================================================
+
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -20,12 +38,21 @@ logger = logging.getLogger(__name__)
 
 
 def _wrap_angle(angle):
+    """Wrap angle to [-180, 180] degrees."""
     while angle >  180: angle -= 360
     while angle < -180: angle += 360
     return angle
 
 
+# ==========================================================
+# ENVIRONMENT CONFIG
+# ==========================================================
 class EnvConfig:
+    """
+    Centralised configuration for CarlaEnv.
+    All tunable parameters in one place.
+    Use from_dict() for EasyCarla-style params dict.
+    """
 
     HOST             = "localhost"
     PORT             = 2000
@@ -42,21 +69,18 @@ class EnvConfig:
     COLLISION_DONE   = True
     OFFROAD_DONE     = True
     WRONG_LANE_DONE  = True
-    WRONG_LANE_LIMIT = 3        # strict — almost immediate
+    WRONG_LANE_LIMIT = 3       # strict — 3 steps = ~0.15s
     WRONG_WAY_DONE   = True
     TRAFFIC_PRESET   = "empty"
     TRAFFIC_LIGHTS   = "off"
     SPECTATOR_MODE   = "follow"
-
-    # Town03 — best curves + roundabouts
-    MAPS = ["Town03"]
-
-    # Curve spawn bias
-    CURVE_SPAWN_BIAS = 0.6
-    CURVE_MIN_ANGLE  = 5.0
+    MAPS             = ["Town03"]   # best curves + roundabouts
+    CURVE_SPAWN_BIAS = 0.6          # 60% spawns near curves
+    CURVE_MIN_ANGLE  = 5.0          # degrees to qualify as curve
 
     @classmethod
     def from_dict(cls, d):
+        """EasyCarla-style params dict → EnvConfig."""
         cfg     = cls()
         mapping = {
             'town'             : ('MAPS',           lambda v: [v]),
@@ -71,16 +95,36 @@ class EnvConfig:
         return cfg
 
 
+# ==========================================================
+# MAIN ENVIRONMENT
+# ==========================================================
 class CarlaEnv(gym.Env):
+    """
+    RLCarla — Full Autonomous Driving Environment.
+
+    Observation : 564D stacked vector (4 × 141D)
+    Action      : [throttle ∈ [0,1], steer ∈ [-1,1],
+                   brake ∈ [0,1]]
+
+    Key design decisions:
+      - Waypoints follow same lane_id (no lane changes)
+      - Intersection offroad is correctly handled
+      - 60% of spawns are near curves (curve training bias)
+      - LiDAR queue flushed on reset (no FPS dip)
+      - Vehicle kickstarted on reset (always moving)
+    """
 
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, config=None, traffic_preset=None, map_name=None):
+    def __init__(self, config=None, traffic_preset=None,
+                 map_name=None):
         super().__init__()
 
         self.cfg             = config or EnvConfig()
         self._map_name       = map_name
-        self._traffic_preset = traffic_preset or self.cfg.TRAFFIC_PRESET
+        self._traffic_preset = (
+            traffic_preset or self.cfg.TRAFFIC_PRESET
+        )
 
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0,
@@ -119,6 +163,7 @@ class CarlaEnv(gym.Env):
     # CONNECTION
     # ==========================================================
     def _connect(self):
+        """Connect to CARLA server and apply sync settings."""
         logger.info("[Env] Connecting to CARLA...")
         self.client    = carla.Client(self.cfg.HOST, self.cfg.PORT)
         self.client.set_timeout(self.cfg.TIMEOUT)
@@ -128,6 +173,7 @@ class CarlaEnv(gym.Env):
         logger.info(f"[Env] Connected. Map: {self.carla_map.name}")
 
     def _apply_sync_settings(self):
+        """Enable synchronous mode with fixed timestep."""
         settings                     = self.world.get_settings()
         settings.synchronous_mode    = True
         settings.fixed_delta_seconds = self.cfg.FIXED_DT
@@ -135,9 +181,13 @@ class CarlaEnv(gym.Env):
         self._obs_builder._dt        = self.cfg.FIXED_DT
 
     # ==========================================================
-    # MAP
+    # MAP LOADING
     # ==========================================================
     def _load_map(self, map_name=None):
+        """
+        Load map only if different from current.
+        Avoids expensive load_world() on every reset.
+        """
         current = self.world.get_map().name.split("/")[-1]
         target  = map_name or random.choice(self.cfg.MAPS)
 
@@ -154,6 +204,10 @@ class CarlaEnv(gym.Env):
     # TRAFFIC LIGHTS
     # ==========================================================
     def _configure_traffic_lights(self):
+        """
+        'off' → freeze all lights green (phase 1 training)
+        'on'  → normal traffic light behaviour (phase 2+)
+        """
         actors = self.world.get_actors().filter(
             "traffic.traffic_light*"
         )
@@ -168,10 +222,15 @@ class CarlaEnv(gym.Env):
             logger.info("[Env] Traffic lights NORMAL")
 
     # ==========================================================
-    # SPECTATOR
+    # SPECTATOR CAMERA
     # ==========================================================
     def _update_spectator(self):
-        if self.cfg.SPECTATOR_MODE == "none" or self.vehicle is None:
+        """
+        Sync CARLA world camera to ego vehicle.
+        Modes: 'follow' (3rd person), 'top' (bird-eye), 'none'
+        """
+        if self.cfg.SPECTATOR_MODE == "none" or \
+                self.vehicle is None:
             return
 
         spectator = self.world.get_spectator()
@@ -192,9 +251,16 @@ class CarlaEnv(gym.Env):
             ))
 
     # ==========================================================
-    # TRAJECTORY OVERLAY
+    # TRAJECTORY OVERLAY (CARLA world debug draw)
     # ==========================================================
     def _draw_trajectory_overlay(self):
+        """
+        Draws two overlays in CARLA world space:
+          White dots — road centerline (ideal path)
+          Green line — kinematic prediction (agent intention)
+            uses bicycle model: wheelbase + current steer
+        Visible in CARLA spectator window.
+        """
         if self.vehicle is None:
             return
 
@@ -224,7 +290,7 @@ class CarlaEnv(gym.Env):
                 life_time = 0.06,
             )
 
-        # Green line — kinematic prediction
+        # Green line — kinematic bicycle model prediction
         vel       = self.vehicle.get_velocity()
         control   = self.vehicle.get_control()
         speed     = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
@@ -233,7 +299,7 @@ class CarlaEnv(gym.Env):
         y         = loc.y
         z         = loc.z + 0.3
         yaw       = math.radians(tf.rotation.yaw)
-        wheelbase = 2.87
+        wheelbase = 2.87   # Tesla Model 3
         prev_loc  = carla.Location(x=x, y=y, z=z)
 
         for i in range(25):
@@ -264,9 +330,14 @@ class CarlaEnv(gym.Env):
             prev_loc = new_loc
 
     # ==========================================================
-    # CURVE-BIASED SPAWN
+    # CURVE-BIASED SPAWNING
     # ==========================================================
     def _get_curve_spawn_points(self):
+        """
+        Filter spawn points to find ones with curves ahead.
+        Curve defined as yaw_diff > CURVE_MIN_ANGLE within 10m.
+        Returns (curved_points, all_points).
+        """
         spawn_points = self.carla_map.get_spawn_points()
         curved = []
 
@@ -287,6 +358,10 @@ class CarlaEnv(gym.Env):
         return curved, spawn_points
 
     def _spawn_vehicle(self):
+        """
+        Spawn ego vehicle (blue Tesla Model 3).
+        60% chance to spawn near a curve (CURVE_SPAWN_BIAS).
+        """
         bp_lib = self.world.get_blueprint_library()
         bp     = random.choice(
             bp_lib.filter("vehicle.tesla.model3")
@@ -318,6 +393,7 @@ class CarlaEnv(gym.Env):
     # SENSORS
     # ==========================================================
     def _attach_sensors(self):
+        """Attach LiDAR, camera and collision sensor to ego."""
         self._lidar = LidarSensor(self.vehicle, self.world)
         self.actor_list.append(self._lidar._sensor)
 
@@ -339,6 +415,7 @@ class CarlaEnv(gym.Env):
         self.actor_list.append(self._collision_sensor)
 
     def _on_collision(self, event):
+        """Collision callback — sets flag for this step."""
         self._collision_flag = True
         logger.debug(
             f"[Env] Collision: {event.other_actor.type_id}"
@@ -348,6 +425,7 @@ class CarlaEnv(gym.Env):
     # TRAFFIC
     # ==========================================================
     def _spawn_traffic(self):
+        """Spawn NPC traffic according to current preset."""
         if self._traffic is not None:
             self._traffic.destroy()
         self._traffic = TrafficManager(self.client, self.world)
@@ -361,6 +439,11 @@ class CarlaEnv(gym.Env):
     # RESET
     # ==========================================================
     def reset(self, seed=None, options=None, map_name=None):
+        """
+        Reset environment for new episode.
+        Order: cleanup → map → spawn → sensors →
+               traffic → kickstart → flush → obs
+        """
         super().reset(seed=seed)
         map_name = (options or {}).get("map_name", map_name)
 
@@ -376,6 +459,7 @@ class CarlaEnv(gym.Env):
         if not self._spawn_vehicle():
             raise RuntimeError("Could not spawn ego vehicle.")
 
+        # Warm up physics before sensors
         for _ in range(10):
             self.world.tick()
 
@@ -383,7 +467,8 @@ class CarlaEnv(gym.Env):
         self._configure_traffic_lights()
         self._spawn_traffic()
 
-        # Kickstart
+        # Kickstart — ensures vehicle is moving at step 0
+        # Prevents stuck-at-spawn during random exploration
         for _ in range(15):
             self.vehicle.apply_control(carla.VehicleControl(
                 throttle = 0.5,
@@ -392,10 +477,11 @@ class CarlaEnv(gym.Env):
             ))
             self.world.tick()
 
-        # Flush LiDAR queue
+        # Flush LiDAR queue — prevents FPS dip from backlog
         if self._lidar is not None:
             self._lidar.flush()
 
+        # Reset all episode state
         self._collision_flag   = False
         self._offroad_flag     = False
         self._wrong_way_flag   = False
@@ -408,6 +494,7 @@ class CarlaEnv(gym.Env):
         self._obs_builder.reset(self.vehicle)
         self._reward_calc.reset()
 
+        # Warm up sensors
         for _ in range(5):
             self.world.tick()
 
@@ -426,7 +513,10 @@ class CarlaEnv(gym.Env):
     # STEP
     # ==========================================================
     def step(self, action):
-
+        """
+        Apply action, tick world, build obs, compute reward.
+        Returns: (obs, reward, done, truncated, info)
+        """
         self._step_count += 1
 
         throttle = float(np.clip(action[0],  0.0, 1.0))
@@ -456,6 +546,7 @@ class CarlaEnv(gym.Env):
 
         done, term_reason = self._terminal()
 
+        # Reset collision flag after reading (per-step flag)
         self._collision_flag = False
         self._prev_action    = np.array(action, dtype=np.float32)
 
@@ -479,11 +570,19 @@ class CarlaEnv(gym.Env):
         return obs, reward, done, False, info
 
     # ==========================================================
-    # FLAGS
+    # FLAG UPDATES
     # ==========================================================
     def _update_flags(self, action):
+        """
+        Update all episode state flags each step:
+          - stuck_count
+          - offroad_flag (with junction false-positive fix)
+          - wrong_lane_count
+          - wrong_way_flag
+        """
         speed = self._get_speed()
 
+        # Stuck counter
         if speed < self.cfg.STUCK_SPEED:
             self._stuck_count += 1
         else:
@@ -493,16 +592,31 @@ class CarlaEnv(gym.Env):
         wp_raw = self.carla_map.get_waypoint(
             loc, project_to_road=False
         )
-        self._offroad_flag = (wp_raw is None)
 
+        # 🔥 Intersection false-positive fix
+        # CARLA returns None at junctions even on valid road
+        # Check if we're at a junction before flagging offroad
         wp_road = self.carla_map.get_waypoint(
             loc,
             project_to_road = True,
             lane_type       = carla.LaneType.Driving
         )
 
+        if wp_raw is None and wp_road is not None:
+            if wp_road.is_junction:
+                # Inside junction — not actually offroad
+                self._offroad_flag = False
+            else:
+                # Genuinely offroad
+                self._offroad_flag = True
+        else:
+            self._offroad_flag = (wp_raw is None)
+
+        # Wrong lane detection (lane_id sign check)
         if wp_raw is not None and wp_road is not None:
-            in_wrong_lane = (wp_raw.lane_id * wp_road.lane_id < 0)
+            in_wrong_lane = (
+                wp_raw.lane_id * wp_road.lane_id < 0
+            )
         else:
             in_wrong_lane = False
 
@@ -511,6 +625,8 @@ class CarlaEnv(gym.Env):
         else:
             self._wrong_lane_count  = 0
 
+        # Wrong way detection (yaw diff > 90°)
+        # Skip at junctions — turns are valid there
         self._wrong_way_flag = False
         if wp_road is not None and not wp_road.is_junction:
             ego_yaw  = self.vehicle.get_transform().rotation.yaw
@@ -523,9 +639,13 @@ class CarlaEnv(gym.Env):
                 self._wrong_way_flag = True
 
     # ==========================================================
-    # TERMINAL
+    # TERMINAL CONDITIONS
     # ==========================================================
     def _terminal(self):
+        """
+        Check all termination conditions.
+        Returns (done: bool, reason: str or None).
+        """
         if self._stuck_count > self.cfg.STUCK_LIMIT:
             return True, "stuck"
         if self.cfg.COLLISION_DONE and self._collision_flag:
@@ -545,6 +665,7 @@ class CarlaEnv(gym.Env):
     # REWARD
     # ==========================================================
     def _get_reward(self, obs, action):
+        """Delegate reward computation to RewardCalculator."""
         return self._reward_calc.compute(
             vehicle    = self.vehicle,
             carla_map  = self.carla_map,
@@ -559,13 +680,14 @@ class CarlaEnv(gym.Env):
     # HELPERS
     # ==========================================================
     def _get_speed(self):
+        """Return ego vehicle speed in m/s."""
         if self.vehicle is None:
             return 0.0
         v = self.vehicle.get_velocity()
         return math.sqrt(v.x**2 + v.y**2 + v.z**2)
 
     # ==========================================================
-    # CAMERA
+    # CAMERA CONTROL (runtime switching)
     # ==========================================================
     def set_camera_view(self, view_name):
         if self._camera is not None:
@@ -594,18 +716,21 @@ class CarlaEnv(gym.Env):
         return []
 
     def set_spectator_mode(self, mode):
+        """Switch spectator: 'follow', 'top', 'none'"""
         self.cfg.SPECTATOR_MODE = mode
 
     # ==========================================================
-    # TRAFFIC
+    # TRAFFIC CONTROL (runtime)
     # ==========================================================
     def set_traffic_preset(self, preset):
+        """Hot-swap traffic density without full reset."""
         self._traffic_preset = preset
         if self._traffic is not None:
             self._traffic.destroy()
         self._spawn_traffic()
 
     def set_traffic_count(self, n_vehicles, n_walkers=0):
+        """Set exact NPC counts."""
         self._traffic_preset = None
         if self._traffic is not None:
             self._traffic.destroy()
@@ -617,6 +742,7 @@ class CarlaEnv(gym.Env):
         )
 
     def set_traffic_lights(self, mode):
+        """Switch traffic lights on/off at runtime."""
         self.cfg.TRAFFIC_LIGHTS = mode
         self._configure_traffic_lights()
 
@@ -624,6 +750,10 @@ class CarlaEnv(gym.Env):
     # CLEANUP
     # ==========================================================
     def _cleanup(self):
+        """
+        Destroy all actors from previous episode.
+        Uses apply_batch for fast batch destruction.
+        """
         if self._lidar is not None:
             self._lidar.destroy()
             self._lidar = None
@@ -654,6 +784,7 @@ class CarlaEnv(gym.Env):
         self.vehicle = None
 
     def close(self):
+        """Clean shutdown — restore async mode."""
         self._cleanup()
         try:
             settings                     = self.world.get_settings()
@@ -665,9 +796,10 @@ class CarlaEnv(gym.Env):
         logger.info("[Env] Closed.")
 
     # ==========================================================
-    # UTILS
+    # UTILITIES
     # ==========================================================
     def get_episode_info(self):
+        """Return dict of current episode statistics."""
         return {
             "episode"       : self._episode,
             "step"          : self._step_count,
