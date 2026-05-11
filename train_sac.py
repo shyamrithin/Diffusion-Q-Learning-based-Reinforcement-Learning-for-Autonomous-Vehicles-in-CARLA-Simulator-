@@ -1,19 +1,17 @@
 # ==========================================================
 # train_sac.py
-# SAC Baseline Training Script
+# SAC Baseline Training Script v2
 #
-# Trains SAC agent in identical RLCarla-v0 environment
-# as Diffusion-QL for fair algorithmic comparison.
+# Changes from v1:
+#   - MAX_EPISODES = 1300 (~8 hours on RTX 4050)
+#   - Traffic lights ON at episode 400 (was 1000)
+#   - total_steps accounts for resume offset
+#   - Early throttle bias < 20k steps
+#     prevents aggressive braking exploration
+#   - Curriculum adjusted for 1300 episode budget
 #
-# Differences from train_diffusion.py:
-#   - Uses SAC agent (agents/sac.py)
-#   - No action smoothing (SAC explores via entropy)
-#   - Checkpoints saved as sac_actor_N.pth
-#   - Logs to runs/rlcarla_sac for separate TensorBoard
-#
-# Everything else identical:
-#   Same env, same reward, same obs, same curriculum,
-#   same map (Town03), same buffer size.
+# Everything else identical to Diffusion-QL setup:
+#   Same env, reward, obs, map (Town03), buffer size.
 #
 # CARLA 0.9.16 | Gymnasium 1.3 | Python 3.10
 # ==========================================================
@@ -53,47 +51,50 @@ torch.set_float32_matmul_precision("medium")
 # ==========================================================
 class SACConfig:
     """
-    SAC training configuration.
-    Matches Diffusion-QL setup for fair comparison.
-    Note: SAC uses higher LR than Diffusion-QL
-    (SAC is more stable so can tolerate it).
+    SAC training configuration v2.
+    Optimised for 1300 episode budget (~8 hours RTX 4050).
+
+    Curriculum scaled to 1300 episodes:
+      ep 0-200   : empty roads
+      ep 200-500 : light traffic
+      ep 500-800 : medium traffic
+      ep 800+    : heavy traffic
+      ep 400+    : traffic lights ON
     """
 
     WIDTH          = 800
     HEIGHT         = 450
     FPS            = 20
 
-    MAX_EPISODES   = 2000
+    MAX_EPISODES   = 1300
     MAX_STEPS      = 1000
 
-    # SAC warms up faster than Diffusion-QL
     START_RANDOM_STEPS = 5000
-    POLICY_RANDOM_MIX  = 0.05   # less random — SAC explores via entropy
+    POLICY_RANDOM_MIX  = 0.05
 
     BATCH_SIZE     = 256
-    TRAIN_FREQ     = 2          # SAC more stable — can train more often
+    TRAIN_FREQ     = 2
     SAVE_EVERY     = 10
 
     BUFFER_SIZE    = 200000
 
     DISCOUNT       = 0.99
     TAU            = 0.005
-    LR             = 3e-4      # higher than DQL — SAC is stable
+    LR             = 3e-4
     GRAD_NORM      = 0.5
     HIDDEN_DIM     = 256
     AUTO_ENTROPY   = True
 
-    # Same curriculum as Diffusion-QL
     CURRICULUM = [
-        (0,    "empty"),
-        (500,  "light"),
-        (1000, "medium"),
-        (2000, "heavy"),
+        (0,   "empty"),
+        (200, "light"),
+        (500, "medium"),
+        (800, "heavy"),
     ]
 
     TRAFFIC_LIGHT_CURRICULUM = [
-        (0,    "off"),
-        (1000, "on"),
+        (0,   "off"),
+        (400, "on"),
     ]
 
     CHECKPOINT_DIR = "checkpoints_sac"
@@ -107,12 +108,13 @@ cfg = SACConfig()
 
 
 # ==========================================================
-# REPLAY BUFFER (same as Diffusion-QL)
+# REPLAY BUFFER
 # ==========================================================
 class ReplayBuffer:
     """
     Experience replay buffer with reward clipping.
     Identical to Diffusion-QL buffer for fair comparison.
+    Reward clipped to [-10, 10] prevents Q explosion.
     """
 
     def __init__(self, state_dim, action_dim, max_size):
@@ -146,13 +148,20 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.max_size)
 
     def sample(self, batch_size, device):
-        idx = np.random.randint(0, self.size, size=batch_size)
+        idx = np.random.randint(
+            0, self.size, size=batch_size
+        )
         return (
-            torch.FloatTensor(self.state[idx]).to(device),
-            torch.FloatTensor(self.action[idx]).to(device),
-            torch.FloatTensor(self.next_state[idx]).to(device),
-            torch.FloatTensor(self.reward[idx]).to(device),
-            torch.FloatTensor(self.not_done[idx]).to(device),
+            torch.FloatTensor(
+                self.state[idx]).to(device),
+            torch.FloatTensor(
+                self.action[idx]).to(device),
+            torch.FloatTensor(
+                self.next_state[idx]).to(device),
+            torch.FloatTensor(
+                self.reward[idx]).to(device),
+            torch.FloatTensor(
+                self.not_done[idx]).to(device),
         )
 
     def __len__(self):
@@ -163,7 +172,10 @@ class ReplayBuffer:
 # HELPERS
 # ==========================================================
 def random_action():
-    """Random exploration action."""
+    """
+    Random exploration action.
+    Never brakes — keeps vehicle moving during warmup.
+    """
     return np.array([
         np.random.uniform(0.5, 0.85),
         np.random.uniform(-0.25, 0.25),
@@ -172,6 +184,7 @@ def random_action():
 
 
 def get_traffic_preset(episode):
+    """Return traffic preset for current episode."""
     preset = "empty"
     for ep_thresh, p in cfg.CURRICULUM:
         if episode >= ep_thresh:
@@ -180,6 +193,7 @@ def get_traffic_preset(episode):
 
 
 def get_traffic_lights(episode):
+    """Return traffic light mode for current episode."""
     mode = "off"
     for ep_thresh, m in cfg.TRAFFIC_LIGHT_CURRICULUM:
         if episode >= ep_thresh:
@@ -188,12 +202,13 @@ def get_traffic_lights(episode):
 
 
 def find_latest_checkpoint(checkpoint_dir):
-    """Find latest SAC checkpoint."""
+    """Find latest SAC checkpoint (excluding 9999)."""
     if not os.path.exists(checkpoint_dir):
         return 0, None
     files = [
         f for f in os.listdir(checkpoint_dir)
-        if f.startswith("sac_actor_") and f.endswith(".pth")
+        if f.startswith("sac_actor_") and
+        f.endswith(".pth")
     ]
     episodes = []
     for f in files:
@@ -208,29 +223,54 @@ def find_latest_checkpoint(checkpoint_dir):
 
 
 # ==========================================================
-# LIDAR VISUALIZER (same as Diffusion-QL)
+# LIDAR VISUALIZER
 # ==========================================================
 def draw_point_cloud(screen, points, center_x, center_y,
                      size=180, max_range=30.0):
-    """Square LiDAR point cloud panel."""
+    """Square LiDAR point cloud — blue SAC theme."""
     font_s = pygame.font.SysFont("monospace", 10)
+
     bg = pygame.Surface((size, size), pygame.SRCALPHA)
     bg.fill((0, 0, 0, 175))
     screen.blit(bg, (center_x-size//2, center_y-size//2))
+
     pygame.draw.rect(
-        screen, (0, 130, 0),
+        screen, (0, 100, 200),
         (center_x-size//2, center_y-size//2, size, size), 1
     )
     pygame.draw.line(
-        screen, (0, 40, 0),
+        screen, (0, 30, 60),
         (center_x-size//2, center_y),
         (center_x+size//2, center_y), 1
     )
     pygame.draw.line(
-        screen, (0, 40, 0),
+        screen, (0, 30, 60),
         (center_x, center_y-size//2),
         (center_x, center_y+size//2), 1
     )
+    for offset in [-size//4, size//4]:
+        pygame.draw.line(
+            screen, (0, 20, 40),
+            (center_x-size//2, center_y+offset),
+            (center_x+size//2, center_y+offset), 1
+        )
+        pygame.draw.line(
+            screen, (0, 20, 40),
+            (center_x+offset, center_y-size//2),
+            (center_x+offset, center_y+size//2), 1
+        )
+
+    pygame.draw.polygon(screen, (0, 150, 255), [
+        (center_x,   center_y-size//2-7),
+        (center_x-4, center_y-size//2+1),
+        (center_x+4, center_y-size//2+1),
+    ])
+
+    lbl_30 = font_s.render("30m", True, (0, 80, 160))
+    lbl_15 = font_s.render("15m", True, (0, 60, 120))
+    screen.blit(lbl_30, (center_x+3, center_y-size//2+2))
+    screen.blit(lbl_15, (center_x+3, center_y-size//4+2))
+
     if len(points) > 0:
         scale = (size//2) / max_range
         x_pts = points[:,0]
@@ -241,6 +281,7 @@ def draw_point_cloud(screen, points, center_x, center_y,
         x_pts = x_pts[mask]
         y_pts = y_pts[mask]
         z_pts = z_pts[mask]
+
         for i in range(len(x_pts)):
             rx = int(center_x - y_pts[i] * scale)
             ry = int(center_y - x_pts[i] * scale)
@@ -255,18 +296,41 @@ def draw_point_cloud(screen, points, center_x, center_y,
             elif pz < 0.5:  color = (0,   180,  80)
             elif pz < 1.5:  color = (255, 140,   0)
             else:           color = (80,  80,  255)
-            pygame.draw.circle(screen, color, (rx, ry), 2)
+            pygame.draw.circle(
+                screen, color, (rx, ry), 2
+            )
+
     pygame.draw.circle(
-        screen, (0, 200, 255), (center_x, center_y), 5
+        screen, (0, 150, 255), (center_x, center_y), 5
     )
     pygame.draw.circle(
         screen, (255, 255, 255), (center_x, center_y), 2
     )
-    title = font_s.render("LiDAR [SAC]", True, (0, 200, 0))
+
+    title = font_s.render(
+        "LiDAR [SAC]", True, (0, 150, 255)
+    )
     screen.blit(title, (
         center_x - title.get_width()//2,
         center_y + size//2 + 4
     ))
+
+    legend = [
+        ((50,  50,  50),  "gnd"),
+        ((100, 100, 100), "low"),
+        ((0,   180,  80), "mid"),
+        ((255, 140,   0), "obj"),
+        ((80,  80,  255), "top"),
+    ]
+    lx = center_x - size//2 + 4
+    ly = center_y + size//2 - 75
+    for color, label in legend:
+        pygame.draw.circle(
+            screen, color, (lx+4, ly+4), 3
+        )
+        lbl = font_s.render(label, True, color)
+        screen.blit(lbl, (lx+10, ly))
+        ly += 14
 
 
 # ==========================================================
@@ -275,8 +339,9 @@ def draw_point_cloud(screen, points, center_x, center_y,
 def draw_hud(screen, font, info, total_steps, episode,
              ep_reward, replay_size, traffic_preset,
              tl_mode, view, start_episode):
+    """Blue-themed HUD for SAC."""
     lines = [
-        f"[SAC] Episode  : {episode} (+{episode-start_episode})",
+        f"[SAC] Ep    : {episode} (+{episode-start_episode})",
         f"Step        : {info.get('step', 0)}",
         f"Total Steps : {total_steps}",
         f"Ep Reward   : {ep_reward:.1f}",
@@ -285,13 +350,16 @@ def draw_hud(screen, font, info, total_steps, episode,
         f"Traffic     : {traffic_preset}",
         f"Lights      : {tl_mode}",
         f"View        : {view}",
-        f"Map         : {str(info.get('map','?')).split('/')[-1]}",
+        f"Map         : "
+        f"{str(info.get('map','?')).split('/')[-1]}",
     ]
+
     surf = pygame.Surface(
         (260, len(lines)*22+10), pygame.SRCALPHA
     )
-    surf.fill((0, 0, 30, 140))   # slight blue tint for SAC
+    surf.fill((0, 0, 30, 140))
     screen.blit(surf, (5, 5))
+
     for i, line in enumerate(lines):
         txt = font.render(line, True, (200, 220, 255))
         screen.blit(txt, (10, 10+i*22))
@@ -329,9 +397,13 @@ agent = SAC(
     auto_entropy = cfg.AUTO_ENTROPY,
 )
 
-# Resume if checkpoint exists
+# ==========================================================
+# RESUME
+# ==========================================================
 start_episode = 0
-latest_ep, path = find_latest_checkpoint(cfg.CHECKPOINT_DIR)
+latest_ep, path = find_latest_checkpoint(
+    cfg.CHECKPOINT_DIR
+)
 if latest_ep > 0:
     agent.load_model(path, id=latest_ep)
     start_episode = latest_ep
@@ -339,10 +411,11 @@ if latest_ep > 0:
 else:
     logger.info("SAC starting fresh")
 
-replay       = ReplayBuffer(OBS_DIM, 3, cfg.BUFFER_SIZE)
-best_reward  = -1e9
-total_steps  = 0
-current_view = "third_person"
+replay      = ReplayBuffer(OBS_DIM, 3, cfg.BUFFER_SIZE)
+best_reward = -1e9
+# Account for steps already done on resume
+total_steps = start_episode * 200
+current_view= "third_person"
 
 logger.info(f"Algorithm     : SAC (baseline)")
 logger.info(f"Device        : {cfg.DEVICE}")
@@ -352,6 +425,8 @@ logger.info(f"Target end    : {cfg.MAX_EPISODES}")
 logger.info(f"LR            : {cfg.LR}")
 logger.info(f"Auto entropy  : {cfg.AUTO_ENTROPY}")
 logger.info(f"Train freq    : {cfg.TRAIN_FREQ}")
+logger.info(f"Reward clip   : [-10, 10]")
+logger.info(f"Throttle bias : < 20k steps")
 
 # ==========================================================
 # TRAINING LOOP
@@ -389,16 +464,24 @@ try:
 
             if keys[pygame.K_1]:
                 current_view = "third_person"
-                env.unwrapped.set_camera_view(current_view)
+                env.unwrapped.set_camera_view(
+                    current_view
+                )
             elif keys[pygame.K_2]:
                 current_view = "driver"
-                env.unwrapped.set_camera_view(current_view)
+                env.unwrapped.set_camera_view(
+                    current_view
+                )
             elif keys[pygame.K_3]:
                 current_view = "front"
-                env.unwrapped.set_camera_view(current_view)
+                env.unwrapped.set_camera_view(
+                    current_view
+                )
             elif keys[pygame.K_4]:
                 current_view = "bird_eye"
-                env.unwrapped.set_camera_view(current_view)
+                env.unwrapped.set_camera_view(
+                    current_view
+                )
 
             if keys[pygame.K_5]:
                 env.unwrapped.set_spectator_mode("follow")
@@ -410,26 +493,33 @@ try:
             if not running:
                 break
 
-            # SAC action selection
+            # Action selection
             if total_steps < cfg.START_RANDOM_STEPS:
                 action = random_action()
             elif np.random.rand() < cfg.POLICY_RANDOM_MIX:
                 action = random_action()
             else:
-                # SAC explores via entropy — no smoothing needed
                 action = agent.sample_action(state)
+
+            # 🔥 Early training throttle bias
+            # SAC entropy explores brake aggressively early
+            # Force minimum throttle + cap brake < 20k steps
+            if total_steps < 20000:
+                action[0] = max(action[0], 0.4)
+                action[2] = min(action[2], 0.1)
 
             next_state, reward, done, trunc, info = \
                 env.step(action)
 
-            replay.add(state, action, next_state, reward, done)
+            replay.add(
+                state, action, next_state, reward, done
+            )
 
             state       = next_state
             ep_reward  += reward
             total_steps += 1
             ep_info     = info
 
-            # SAC trains more frequently — more stable
             if (len(replay) > cfg.BATCH_SIZE and
                     total_steps % cfg.TRAIN_FREQ == 0):
 
@@ -448,8 +538,12 @@ try:
             # Render
             frame = env.unwrapped.get_camera_frame()
             if frame is not None:
-                cam_tf = env.unwrapped.get_camera_transform()
-                K      = env.unwrapped.get_camera_intrinsic()
+                cam_tf = (
+                    env.unwrapped.get_camera_transform()
+                )
+                K = (
+                    env.unwrapped.get_camera_intrinsic()
+                )
                 if cam_tf is not None and K is not None:
                     waypoints = get_future_waypoints(
                         env.unwrapped.vehicle,
@@ -473,7 +567,9 @@ try:
             )
 
             if env.unwrapped._lidar is not None:
-                points = env.unwrapped._lidar.get_points()
+                points = (
+                    env.unwrapped._lidar.get_points()
+                )
                 draw_point_cloud(
                     screen, points,
                     center_x  = cfg.WIDTH  - 100,
@@ -488,7 +584,7 @@ try:
             if done or trunc:
                 break
 
-        # Logging
+        # Episode logging
         writer.add_scalar(
             "reward/episode",     ep_reward, episode)
         writer.add_scalar(
@@ -498,30 +594,52 @@ try:
 
         if ep_cr_loss:
             writer.add_scalar(
-                "loss/critic", np.mean(ep_cr_loss), episode)
+                "loss/critic",
+                np.mean(ep_cr_loss), episode)
             writer.add_scalar(
-                "loss/actor",  np.mean(ep_ac_loss), episode)
+                "loss/actor",
+                np.mean(ep_ac_loss), episode)
+
+        for key in [
+            "forward_progress", "lane_center",
+            "yaw_align", "curve_reward", "collision",
+            "off_road", "stuck", "red_light",
+            "wrong_lane", "wrong_way", "comfort",
+            "proximity_reward",
+        ]:
+            if key in ep_info:
+                writer.add_scalar(
+                    f"reward/{key}",
+                    ep_info[key], episode
+                )
 
         logger.info(
-            f"Ep {episode:04d} (+{episode-start_episode:04d}) | "
+            f"Ep {episode:04d} "
+            f"(+{episode-start_episode:04d}) | "
             f"Reward {ep_reward:8.2f} | "
             f"Steps {step+1:4d} | "
             f"Traffic {traffic_preset:6s} | "
+            f"Lights {tl_mode:3s} | "
             f"Buffer {len(replay):6d} | "
             f"Done: {ep_info.get('term_reason','trunc')}"
         )
 
         if episode % cfg.SAVE_EVERY == 0:
-            agent.save_model(cfg.CHECKPOINT_DIR, id=episode)
+            agent.save_model(
+                cfg.CHECKPOINT_DIR, id=episode
+            )
             logger.info(
-                f"[SAC] Checkpoint saved — episode {episode}"
+                f"[SAC] Checkpoint — episode {episode}"
             )
 
         if ep_reward > best_reward:
             best_reward = ep_reward
-            agent.save_model(cfg.CHECKPOINT_DIR, id=9999)
+            agent.save_model(
+                cfg.CHECKPOINT_DIR, id=9999
+            )
             logger.info(
-                f"[SAC] New best — reward {best_reward:.2f}"
+                f"[SAC] New best — "
+                f"reward {best_reward:.2f}"
             )
 
 except KeyboardInterrupt:
