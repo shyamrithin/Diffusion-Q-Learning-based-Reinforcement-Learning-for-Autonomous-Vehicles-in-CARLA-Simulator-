@@ -1,18 +1,22 @@
 # ==========================================================
 # train_diffusion.py
-# RLCarla Training Script v6
+# RLCarla Training Script v7
 #
-# Changes from v5:
-#   - MAX_EPISODES = 1300 (matches SAC for fair comparison)
-#   - Curriculum scaled to 1300 episode budget:
-#     light at 200, medium at 500, heavy at 800
-#   - Traffic lights ON at 400 (was 2000)
-#   - Early throttle bias added < 20k steps
-#     Prevents aggressive braking exploration
-#   - All v5 fixes retained:
-#     LR=3e-5, GRAD_NORM=0.1, ETA=0.001, TRAIN_FREQ=6
-#     Reward clipping [-10, 10]
-#     not_done fix, action smoothing, resume helper
+# Changes from v6:
+#   - Critic pre-training phase (20k steps)
+#     Critic trains alone before BC/QL competition
+#     Gives stable Q-values before actor updates
+#   - ETA scheduling (0.0 → 0.001 over 50k steps)
+#     No BC/QL competition in early training
+#     Prevents actor from destabilising critic
+#   - Periodic critic target reset every 10k steps
+#     Prevents target network error accumulation
+#   - MAX_EPISODES = 1300 (fair comparison with SAC/PPO)
+#   - Curriculum matched to SAC/PPO
+#   - All v6 fixes retained:
+#     LR=3e-5 (actor), Critic LR=3e-4 (auto in agent)
+#     GRAD_NORM=0.1, reward clipping [-10,10]
+#     Action smoothing, resume helper
 #
 # CARLA 0.9.16 | Gymnasium 1.3 | Python 3.10
 # ==========================================================
@@ -33,7 +37,6 @@ import carla
 
 from torch.utils.tensorboard  import SummaryWriter
 from agents.ql_diffusion       import Diffusion_QL
-from agents.ql_diffusion       import Critic
 from rlcarla.core.obs_builder  import OBS_DIM
 from rlcarla.utils.trajectory  import (
     draw_trajectory, get_future_waypoints
@@ -54,59 +57,78 @@ torch.set_float32_matmul_precision("medium")
 # ==========================================================
 class TrainConfig:
     """
-    Diffusion-QL training config v6.
+    Diffusion-QL training config v7.
 
-    Matched to SAC config for fair comparison:
+    Key additions:
+      PRE_TRAIN_CRITIC_STEPS = 20000
+        Critic trains alone first — no actor updates
+        Gives stable Q-value foundation
+
+      ETA_START = 0.0, ETA_END = 0.001
+        Gradually introduce QL loss
+        Prevents BC/QL competition in early training
+
+      CRITIC_RESET_FREQ = 10000
+        Periodic hard reset of critic target
+        Prevents error accumulation
+
+    All matched to SAC/PPO for fair comparison:
       MAX_EPISODES = 1300
-      Same curriculum thresholds as train_sac.py
+      Same curriculum thresholds
       Same traffic light schedule
-      Same reward clipping
-
-    DQL-specific:
-      LR        = 3e-5   (10x lower than SAC — critic stability)
-      GRAD_NORM = 0.1    (tight — prevents critic explosion)
-      ETA       = 0.001  (low — reduces Q-loss dominance)
-      TRAIN_FREQ = 6     (less frequent — more stable)
     """
 
     WIDTH          = 800
     HEIGHT         = 450
     FPS            = 20
 
-    MAX_EPISODES          = 6000
+    MAX_EPISODES          = 1300
     MAX_STEPS             = 1000
 
     START_RANDOM_STEPS    = 10000
     POLICY_RANDOM_MIX     = 0.15
 
-    BATCH_SIZE            = 512
-    TRAIN_FREQ            = 4      # less frequent than SAC
+    BATCH_SIZE            = 256
+    TRAIN_FREQ            = 6
     SAVE_EVERY            = 10
 
-    BUFFER_SIZE           = 500000
+    BUFFER_SIZE           = 200000
     ACTION_ALPHA          = 0.7
 
     DISCOUNT              = 0.99
     TAU                   = 0.005
-    ETA                   = 0.001  # lower than SAC
+    ETA                   = 0.001  # final ETA
     BETA_SCHEDULE         = "vp"
     N_TIMESTEPS           = 3
-    LR                    = 3e-5   # 10x lower than SAC
-    GRAD_NORM             = 0.1    # tight gradient clipping
+    LR                    = 3e-5   # actor LR
+    GRAD_NORM             = 0.1
     ACTION_TEMPERATURE    = 0.1
 
-    # Curriculum — matched to SAC for fair comparison
+    # 🔥 Critic pre-training
+    # Critic trains alone for this many steps
+    # before actor updates begin
+    PRE_TRAIN_CRITIC_STEPS = 20000
+
+    # 🔥 ETA scheduling
+    # Start with pure BC (eta=0) → gradually add QL
+    ETA_START  = 0.0
+    ETA_END    = 0.001
+    ETA_WARMUP = 50000   # steps to reach full ETA
+
+    # 🔥 Periodic critic target reset
+    CRITIC_RESET_FREQ = 10000  # steps between resets
+
+    # Curriculum — matched to SAC/PPO
     CURRICULUM = [
         (0,   "empty"),
-        (500,  "light"),
-        (1500, "medium"),
-        (3000, "heavy"),
+        (200, "light"),
+        (500, "medium"),
+        (800, "heavy"),
     ]
 
-    # Traffic lights — matched to SAC
     TRAFFIC_LIGHT_CURRICULUM = [
         (0,   "off"),
-        (1500, "on"),
+        (400, "on"),
     ]
 
     CHECKPOINT_DIR = "checkpoints"
@@ -123,18 +145,12 @@ cfg = TrainConfig()
 # RESUME HELPER
 # ==========================================================
 def find_latest_checkpoint(checkpoint_dir):
-    """
-    Find latest numbered checkpoint (excluding 9999).
-    Returns (episode_number, dir) or (0, None).
-    """
     if not os.path.exists(checkpoint_dir):
         return 0, None
-
     actor_files = [
         f for f in os.listdir(checkpoint_dir)
         if f.startswith("actor_") and f.endswith(".pth")
     ]
-
     episodes = []
     for f in actor_files:
         match = re.search(r"actor_(\d+)\.pth", f)
@@ -142,27 +158,21 @@ def find_latest_checkpoint(checkpoint_dir):
             ep = int(match.group(1))
             if ep != 9999:
                 episodes.append(ep)
-
     if not episodes:
         return 0, None
-
     return max(episodes), checkpoint_dir
 
 
 def resume_training(agent, checkpoint_dir):
-    """
-    Load latest checkpoint and return starting episode.
-    Falls back to best model (9999) if no numbered ones.
-    """
-    latest_ep, path = find_latest_checkpoint(checkpoint_dir)
-
+    latest_ep, path = find_latest_checkpoint(
+        checkpoint_dir
+    )
     if latest_ep > 0:
         agent.load_model(path, id=latest_ep)
         logger.info(
-            f"Resumed from episode {latest_ep} checkpoint"
+            f"Resumed from episode {latest_ep}"
         )
         return latest_ep
-
     best_path = os.path.join(
         checkpoint_dir, "actor_9999.pth"
     )
@@ -170,8 +180,7 @@ def resume_training(agent, checkpoint_dir):
         agent.load_model(checkpoint_dir, id=9999)
         logger.info("Resumed from best model (9999)")
         return 0
-
-    logger.info("No checkpoint found — starting fresh")
+    logger.info("No checkpoint — starting fresh")
     return 0
 
 
@@ -180,9 +189,8 @@ def resume_training(agent, checkpoint_dir):
 # ==========================================================
 class ReplayBuffer:
     """
-    Experience replay buffer with reward clipping.
-    Reward clipped to [-10, 10] — critical for DQL
-    critic stability. Without this critic diverges to 6000+.
+    Replay buffer with reward clipping [-10, 10].
+    Critical for DQL critic stability.
     """
 
     def __init__(self, state_dim, action_dim, max_size):
@@ -206,9 +214,7 @@ class ReplayBuffer:
         )
 
     def add(self, s, a, ns, r, done):
-        # Clip reward — critical for critic stability
         r = float(np.clip(r, -10.0, 10.0))
-
         self.state[self.ptr]      = s
         self.action[self.ptr]     = a
         self.next_state[self.ptr] = ns
@@ -242,10 +248,6 @@ class ReplayBuffer:
 # EXPLORATION
 # ==========================================================
 def random_action():
-    """
-    Biased random exploration.
-    Never brakes — keeps vehicle moving during warmup.
-    """
     throttle = np.random.uniform(0.5, 0.85)
     steer    = np.random.uniform(-0.25, 0.25)
     brake    = 0.0
@@ -256,12 +258,6 @@ def random_action():
 
 def smooth_action(raw_action, prev_action,
                   alpha=cfg.ACTION_ALPHA):
-    """
-    Temporal smoothing on policy actions.
-    alpha=0.7 → 70% new + 30% prev.
-    Removes high-frequency steering jitter.
-    NOT applied to random exploration actions.
-    """
     return (
         alpha * raw_action + (1.0 - alpha) * prev_action
     ).astype(np.float32)
@@ -269,13 +265,18 @@ def smooth_action(raw_action, prev_action,
 
 def choose_action(agent, state, prev_action, total_steps):
     """
-    Action selection with exploration + smoothing.
-
-    Random phase   : pure random, no smoothing
-    Policy phase   : policy + smoothing + throttle bias
-    Random mix     : pure random, no smoothing
+    Action selection:
+      < START_RANDOM_STEPS     : pure random
+      < PRE_TRAIN_CRITIC_STEPS : random (critic pre-training)
+      POLICY_RANDOM_MIX        : random injection
+      otherwise                : policy + smoothing + bias
     """
     if total_steps < cfg.START_RANDOM_STEPS:
+        return random_action()
+
+    # During critic pre-training — keep using random
+    # actions so critic sees diverse experience
+    if total_steps < cfg.PRE_TRAIN_CRITIC_STEPS:
         return random_action()
 
     if np.random.rand() < cfg.POLICY_RANDOM_MIX:
@@ -288,10 +289,8 @@ def choose_action(agent, state, prev_action, total_steps):
     except Exception:
         return random_action()
 
-    # 🔥 Early training throttle bias
-    # DQL entropy explores brake aggressively early
-    # Force minimum throttle + cap brake < 20k steps
-    if total_steps < 20000:
+    # Early throttle bias
+    if total_steps < cfg.PRE_TRAIN_CRITIC_STEPS + 10000:
         raw[0] = max(raw[0], 0.4)
         raw[2] = min(raw[2], 0.1)
 
@@ -299,10 +298,39 @@ def choose_action(agent, state, prev_action, total_steps):
 
 
 # ==========================================================
+# ETA SCHEDULER
+# ==========================================================
+def get_eta(total_steps):
+    """
+    🔥 Gradually increase QL weight (eta).
+
+    Steps 0 → PRE_TRAIN_CRITIC_STEPS:
+      eta = 0.0 (pure BC, no Q-learning pressure)
+
+    Steps PRE_TRAIN_CRITIC_STEPS → ETA_WARMUP:
+      eta linearly increases 0.0 → ETA_END
+
+    Steps > ETA_WARMUP:
+      eta = ETA_END (full Q-learning)
+
+    This prevents BC/QL competition in early training.
+    """
+    if total_steps < cfg.PRE_TRAIN_CRITIC_STEPS:
+        return 0.0
+
+    warmup_steps = total_steps - cfg.PRE_TRAIN_CRITIC_STEPS
+    frac         = min(
+        warmup_steps / cfg.ETA_WARMUP, 1.0
+    )
+    return cfg.ETA_START + frac * (
+        cfg.ETA_END - cfg.ETA_START
+    )
+
+
+# ==========================================================
 # CURRICULUM
 # ==========================================================
 def get_traffic_preset(episode):
-    """Return traffic preset for current episode."""
     preset = "empty"
     for ep_thresh, p in cfg.CURRICULUM:
         if episode >= ep_thresh:
@@ -311,7 +339,6 @@ def get_traffic_preset(episode):
 
 
 def get_traffic_lights(episode):
-    """Return traffic light mode for current episode."""
     mode = "off"
     for ep_thresh, m in cfg.TRAFFIC_LIGHT_CURRICULUM:
         if episode >= ep_thresh:
@@ -320,19 +347,10 @@ def get_traffic_lights(episode):
 
 
 # ==========================================================
-# 3D LIDAR — Square panel, every frame
+# LIDAR VISUALIZER
 # ==========================================================
 def draw_point_cloud(screen, points, center_x, center_y,
                      size=180, max_range=30.0):
-    """
-    Render 3D LiDAR as square top-down panel.
-    Colors by height (z):
-      Dark grey → ground      (z < -1.5m)
-      Grey      → near ground (-1.5 to -0.5m)
-      Green     → vehicle lvl (-0.5 to  0.5m)
-      Orange    → obstacle    ( 0.5 to  1.5m)
-      Blue      → tall obj    (> 1.5m)
-    """
     font_s = pygame.font.SysFont("monospace", 10)
 
     bg = pygame.Surface((size, size), pygame.SRCALPHA)
@@ -343,7 +361,6 @@ def draw_point_cloud(screen, points, center_x, center_y,
         screen, (0, 130, 0),
         (center_x-size//2, center_y-size//2, size, size), 1
     )
-
     pygame.draw.line(
         screen, (0, 40, 0),
         (center_x-size//2, center_y),
@@ -354,7 +371,6 @@ def draw_point_cloud(screen, points, center_x, center_y,
         (center_x, center_y-size//2),
         (center_x, center_y+size//2), 1
     )
-
     for offset in [-size//4, size//4]:
         pygame.draw.line(
             screen, (0, 25, 0),
@@ -392,20 +408,17 @@ def draw_point_cloud(screen, points, center_x, center_y,
         for i in range(len(x_pts)):
             rx = int(center_x - y_pts[i] * scale)
             ry = int(center_y - x_pts[i] * scale)
-
             if (rx < center_x-size//2 or
                     rx > center_x+size//2 or
                     ry < center_y-size//2 or
                     ry > center_y+size//2):
                 continue
-
             pz = z_pts[i]
             if pz < -1.5:   color = (50,  50,  50)
             elif pz < -0.5: color = (100, 100, 100)
             elif pz < 0.5:  color = (0,   180,  80)
             elif pz < 1.5:  color = (255, 140,   0)
             else:           color = (80,  80,  255)
-
             pygame.draw.circle(
                 screen, color, (rx, ry), 2
             )
@@ -417,7 +430,7 @@ def draw_point_cloud(screen, points, center_x, center_y,
         screen, (255, 255, 255), (center_x, center_y), 2
     )
 
-    title = font_s.render("LiDAR 3D", True, (0, 200, 0))
+    title = font_s.render("LiDAR [DQL]", True, (0, 200, 0))
     screen.blit(title, (
         center_x - title.get_width()//2,
         center_y + size//2 + 4
@@ -446,10 +459,15 @@ def draw_point_cloud(screen, points, center_x, center_y,
 # ==========================================================
 def draw_hud(screen, font, info, total_steps, episode,
              ep_reward, replay_size, traffic_preset,
-             tl_mode, view, start_episode):
-    """Semi-transparent training HUD."""
+             tl_mode, view, start_episode,
+             current_eta, pre_training):
+    """HUD with ETA and pre-training status."""
+    phase = "CRITIC PRE-TRAIN" if pre_training else "FULL"
+
     lines = [
         f"[DQL] Ep    : {episode} (+{episode-start_episode})",
+        f"Phase       : {phase}",
+        f"ETA         : {current_eta:.5f}",
         f"Step        : {info.get('step', 0)}",
         f"Total Steps : {total_steps}",
         f"Ep Reward   : {ep_reward:.1f}",
@@ -463,13 +481,17 @@ def draw_hud(screen, font, info, total_steps, episode,
     ]
 
     surf = pygame.Surface(
-        (240, len(lines)*22+10), pygame.SRCALPHA
+        (260, len(lines)*22+10), pygame.SRCALPHA
     )
     surf.fill((0, 0, 0, 140))
     screen.blit(surf, (5, 5))
 
     for i, line in enumerate(lines):
-        txt = font.render(line, True, (255, 255, 255))
+        color = (
+            (255, 200, 0) if i == 1 and pre_training
+            else (255, 255, 255)
+        )
+        txt = font.render(line, True, color)
         screen.blit(txt, (10, 10+i*22))
 
 
@@ -478,7 +500,7 @@ def draw_hud(screen, font, info, total_steps, episode,
 # ==========================================================
 pygame.init()
 screen = pygame.display.set_mode((cfg.WIDTH, cfg.HEIGHT))
-pygame.display.set_caption("RLCarla — Diffusion-QL")
+pygame.display.set_caption("RLCarla — Diffusion-QL v7")
 clock  = pygame.time.Clock()
 font   = pygame.font.SysFont("monospace", 16)
 
@@ -517,19 +539,29 @@ best_reward  = -1e9
 total_steps  = start_episode * 200
 current_view = "third_person"
 
-logger.info(f"Algorithm     : Diffusion-QL")
-logger.info(f"Device        : {cfg.DEVICE}")
-logger.info(f"Obs dim       : {OBS_DIM}")
-logger.info(f"Start episode : {start_episode}")
-logger.info(f"Target end    : {cfg.MAX_EPISODES}")
-logger.info(f"LR            : {cfg.LR}")
-logger.info(f"Grad norm     : {cfg.GRAD_NORM}")
-logger.info(f"ETA           : {cfg.ETA}")
-logger.info(f"Train freq    : {cfg.TRAIN_FREQ}")
-logger.info(f"Reward clip   : [-10, 10]")
-logger.info(f"Throttle bias : < 20k steps")
-logger.info(f"Lights ON     : episode 400")
-logger.info(f"Heavy traffic : episode 800")
+logger.info(f"Algorithm        : Diffusion-QL v7")
+logger.info(f"Device           : {cfg.DEVICE}")
+logger.info(f"Obs dim          : {OBS_DIM}")
+logger.info(f"Start episode    : {start_episode}")
+logger.info(f"Target end       : {cfg.MAX_EPISODES}")
+logger.info(f"Actor LR         : {cfg.LR}")
+logger.info(f"Critic LR        : {cfg.LR * 10} (10x)")
+logger.info(f"Grad norm        : {cfg.GRAD_NORM}")
+logger.info(f"Train freq       : {cfg.TRAIN_FREQ}")
+logger.info(f"Reward clip      : [-10, 10]")
+logger.info(
+    f"Critic pre-train : {cfg.PRE_TRAIN_CRITIC_STEPS} steps"
+)
+logger.info(
+    f"ETA schedule     : "
+    f"{cfg.ETA_START} → {cfg.ETA_END} "
+    f"over {cfg.ETA_WARMUP} steps"
+)
+logger.info(
+    f"Critic reset     : every {cfg.CRITIC_RESET_FREQ} steps"
+)
+logger.info(f"Lights ON        : episode 400")
+logger.info(f"Heavy traffic    : episode 800")
 
 # ==========================================================
 # TRAINING LOOP
@@ -550,12 +582,12 @@ try:
 
         state, _ = env.reset()
 
-        prev_action = np.zeros(3, dtype=np.float32)
-        ep_reward   = 0.0
-        ep_bc_loss  = []
-        ep_ql_loss  = []
-        ep_cr_loss  = []
-        ep_info     = {}
+        prev_action  = np.zeros(3, dtype=np.float32)
+        ep_reward    = 0.0
+        ep_bc_loss   = []
+        ep_ql_loss   = []
+        ep_cr_loss   = []
+        ep_info      = {}
 
         for step in range(cfg.MAX_STEPS):
 
@@ -615,26 +647,55 @@ try:
             total_steps += 1
             ep_info     = info
 
-            if (len(replay) > cfg.BATCH_SIZE and
-                    total_steps % cfg.TRAIN_FREQ == 0):
+            # Update ETA dynamically
+            current_eta = get_eta(total_steps)
+            agent.eta   = current_eta
 
-                metric = agent.train(
-                    replay,
-                    iterations = 1,
-                    batch_size = cfg.BATCH_SIZE,
+            # Check if in pre-training phase
+            pre_training = (
+                total_steps < cfg.PRE_TRAIN_CRITIC_STEPS
+            )
+
+            if len(replay) > cfg.BATCH_SIZE:
+
+                if (total_steps %
+                        cfg.TRAIN_FREQ == 0):
+
+                    if pre_training:
+                        # 🔥 Critic pre-training only
+                        cr_loss = agent.train_critic_only(
+                            replay,
+                            batch_size=cfg.BATCH_SIZE,
+                        )
+                        ep_cr_loss.append(cr_loss)
+
+                    else:
+                        # Full actor + critic update
+                        metric = agent.train(
+                            replay,
+                            iterations = 1,
+                            batch_size = cfg.BATCH_SIZE,
+                        )
+                        ep_bc_loss.append(
+                            np.mean(metric["bc_loss"])
+                        )
+                        ep_ql_loss.append(
+                            np.mean(metric["ql_loss"])
+                        )
+                        ep_cr_loss.append(
+                            np.mean(metric["critic_loss"])
+                        )
+
+            # 🔥 Periodic critic target reset
+            if (total_steps > 0 and
+                    total_steps %
+                    cfg.CRITIC_RESET_FREQ == 0):
+                agent.reset_critic_target()
+                writer.add_scalar(
+                    "debug/critic_reset", 1, total_steps
                 )
 
-                ep_bc_loss.append(
-                    np.mean(metric["bc_loss"])
-                )
-                ep_ql_loss.append(
-                    np.mean(metric["ql_loss"])
-                )
-                ep_cr_loss.append(
-                    np.mean(metric["critic_loss"])
-                )
-
-            # Camera + trajectory overlay
+            # Render
             frame = env.unwrapped.get_camera_frame()
 
             if frame is not None:
@@ -644,7 +705,6 @@ try:
                 K = (
                     env.unwrapped.get_camera_intrinsic()
                 )
-
                 if cam_tf is not None and K is not None:
                     waypoints = get_future_waypoints(
                         env.unwrapped.vehicle,
@@ -655,7 +715,6 @@ try:
                         frame, waypoints, K, cam_tf,
                         cfg.WIDTH, cfg.HEIGHT,
                     )
-
                 surf = pygame.surfarray.make_surface(
                     frame.swapaxes(0, 1)
                 )
@@ -666,11 +725,13 @@ try:
                 total_steps, episode, ep_reward,
                 len(replay), traffic_preset,
                 tl_mode, current_view, start_episode,
+                current_eta, pre_training,
             )
 
-            # LiDAR every frame — square panel
             if env.unwrapped._lidar is not None:
-                points = env.unwrapped._lidar.get_points()
+                points = (
+                    env.unwrapped._lidar.get_points()
+                )
                 draw_point_cloud(
                     screen, points,
                     center_x  = cfg.WIDTH  - 100,
@@ -692,17 +753,24 @@ try:
             "reward/total_steps", ep_reward, total_steps)
         writer.add_scalar(
             "env/episode_length", step+1,    episode)
+        writer.add_scalar(
+            "debug/eta",          current_eta, episode)
+        writer.add_scalar(
+            "debug/pre_training",
+            float(pre_training), episode
+        )
 
         if ep_bc_loss:
             writer.add_scalar(
                 "loss/bc",
                 np.mean(ep_bc_loss), episode)
             writer.add_scalar(
-                "loss/critic",
-                np.mean(ep_cr_loss), episode)
-            writer.add_scalar(
                 "loss/ql",
                 np.mean(ep_ql_loss), episode)
+        if ep_cr_loss:
+            writer.add_scalar(
+                "loss/critic",
+                np.mean(ep_cr_loss), episode)
 
         for key in [
             "forward_progress", "lane_center",
@@ -717,6 +785,9 @@ try:
                     ep_info[key], episode
                 )
 
+        phase_str = (
+            "PRE-TRAIN" if pre_training else "FULL"
+        )
         logger.info(
             f"Ep {episode:04d} "
             f"(+{episode-start_episode:04d}) | "
@@ -724,6 +795,8 @@ try:
             f"Steps {step+1:4d} | "
             f"Traffic {traffic_preset:6s} | "
             f"Lights {tl_mode:3s} | "
+            f"ETA {current_eta:.5f} | "
+            f"Phase {phase_str} | "
             f"Buffer {len(replay):6d} | "
             f"Done: {ep_info.get('term_reason','trunc')}"
         )
@@ -755,4 +828,4 @@ finally:
     writer.close()
     env.close()
     pygame.quit()
-    logger.info("DQL training finished.")
+    logger.info("DQL v7 training finished.")

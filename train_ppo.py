@@ -1,18 +1,14 @@
 # ==========================================================
 # train_ppo.py
-# PPO Baseline Training Script
+# PPO Baseline Training Script v2
 #
-# Trains PPO agent in identical RLCarla-v0 environment.
-# Key difference from SAC/Diffusion-QL:
-#   ON-policy — collects ROLLOUT_SIZE steps then updates.
-#   No replay buffer — data discarded after each update.
-#
-# Differences from train_sac.py:
-#   - Uses PPO agent (agents/ppo.py)
-#   - Rollout-based collection (not step-by-step)
-#   - No replay buffer
-#   - Logs to runs/rlcarla_ppo
-#   - Checkpoints as ppo_policy_N.pth
+# Changes from v1:
+#   - MAX_EPISODES = 1300 (matches SAC/DQL for comparison)
+#   - Curriculum scaled to 1300 episode budget:
+#     light at 200, medium at 500, heavy at 800
+#   - Traffic lights ON at 400 (was 1000)
+#   - total_steps accounts for resume offset
+#   - Reward logging keys added for TensorBoard
 #
 # CARLA 0.9.16 | Gymnasium 1.3 | Python 3.10
 # ==========================================================
@@ -52,20 +48,26 @@ torch.set_float32_matmul_precision("medium")
 # ==========================================================
 class PPOConfig:
     """
-    PPO training configuration.
-    Matches Diffusion-QL/SAC env setup for fair comparison.
-    PPO-specific hyperparameters tuned for CARLA.
+    PPO training configuration v2.
+    Matched to SAC/DQL for fair comparison:
+      MAX_EPISODES = 1300
+      Same curriculum thresholds
+      Same traffic light schedule
+
+    PPO-specific:
+      ROLLOUT_SIZE = 2048  (collect before update)
+      PPO_EPOCHS   = 10    (reuse each rollout)
+      No replay buffer — on-policy algorithm
     """
 
     WIDTH          = 800
     HEIGHT         = 450
     FPS            = 20
 
-    MAX_EPISODES   = 2000
+    MAX_EPISODES   = 1300
     MAX_STEPS      = 1000
 
-    # PPO collects full rollout before updating
-    ROLLOUT_SIZE   = 2048   # steps per update
+    ROLLOUT_SIZE   = 2048
     BATCH_SIZE     = 256
     PPO_EPOCHS     = 10
     SAVE_EVERY     = 10
@@ -79,17 +81,17 @@ class PPOConfig:
     ENT_COEF       = 0.01
     HIDDEN_DIM     = 256
 
-    # Same curriculum
+    # Curriculum — matched to SAC/DQL
     CURRICULUM = [
-        (0,    "empty"),
-        (500,  "light"),
-        (1000, "medium"),
-        (2000, "heavy"),
+        (0,   "empty"),
+        (200, "light"),
+        (500, "medium"),
+        (800, "heavy"),
     ]
 
     TRAFFIC_LIGHT_CURRICULUM = [
-        (0,    "off"),
-        (1000, "on"),
+        (0,   "off"),
+        (400, "on"),
     ]
 
     CHECKPOINT_DIR = "checkpoints_ppo"
@@ -106,6 +108,7 @@ cfg = PPOConfig()
 # HELPERS
 # ==========================================================
 def get_traffic_preset(episode):
+    """Return traffic preset for current episode."""
     preset = "empty"
     for ep_thresh, p in cfg.CURRICULUM:
         if episode >= ep_thresh:
@@ -114,6 +117,7 @@ def get_traffic_preset(episode):
 
 
 def get_traffic_lights(episode):
+    """Return traffic light mode for current episode."""
     mode = "off"
     for ep_thresh, m in cfg.TRAFFIC_LIGHT_CURRICULUM:
         if episode >= ep_thresh:
@@ -122,6 +126,7 @@ def get_traffic_lights(episode):
 
 
 def find_latest_checkpoint(checkpoint_dir):
+    """Find latest PPO checkpoint (excluding 9999)."""
     if not os.path.exists(checkpoint_dir):
         return 0, None
     files = [
@@ -142,17 +147,19 @@ def find_latest_checkpoint(checkpoint_dir):
 
 
 # ==========================================================
-# LIDAR VISUALIZER
+# LIDAR VISUALIZER — Red theme for PPO
 # ==========================================================
 def draw_point_cloud(screen, points, center_x, center_y,
                      size=180, max_range=30.0):
-    """Square LiDAR panel — PPO version."""
+    """Square LiDAR panel — red PPO theme."""
     font_s = pygame.font.SysFont("monospace", 10)
+
     bg = pygame.Surface((size, size), pygame.SRCALPHA)
     bg.fill((0, 0, 0, 175))
     screen.blit(bg, (center_x-size//2, center_y-size//2))
+
     pygame.draw.rect(
-        screen, (130, 0, 0),  # red border for PPO
+        screen, (130, 0, 0),
         (center_x-size//2, center_y-size//2, size, size), 1
     )
     pygame.draw.line(
@@ -165,6 +172,30 @@ def draw_point_cloud(screen, points, center_x, center_y,
         (center_x, center_y-size//2),
         (center_x, center_y+size//2), 1
     )
+
+    for offset in [-size//4, size//4]:
+        pygame.draw.line(
+            screen, (30, 0, 0),
+            (center_x-size//2, center_y+offset),
+            (center_x+size//2, center_y+offset), 1
+        )
+        pygame.draw.line(
+            screen, (30, 0, 0),
+            (center_x+offset, center_y-size//2),
+            (center_x+offset, center_y+size//2), 1
+        )
+
+    pygame.draw.polygon(screen, (255, 80, 80), [
+        (center_x,   center_y-size//2-7),
+        (center_x-4, center_y-size//2+1),
+        (center_x+4, center_y-size//2+1),
+    ])
+
+    lbl_30 = font_s.render("30m", True, (160, 60, 60))
+    lbl_15 = font_s.render("15m", True, (120, 40, 40))
+    screen.blit(lbl_30, (center_x+3, center_y-size//2+2))
+    screen.blit(lbl_15, (center_x+3, center_y-size//4+2))
+
     if len(points) > 0:
         scale = (size//2) / max_range
         x_pts = points[:,0]
@@ -175,6 +206,7 @@ def draw_point_cloud(screen, points, center_x, center_y,
         x_pts = x_pts[mask]
         y_pts = y_pts[mask]
         z_pts = z_pts[mask]
+
         for i in range(len(x_pts)):
             rx = int(center_x - y_pts[i] * scale)
             ry = int(center_y - x_pts[i] * scale)
@@ -189,25 +221,52 @@ def draw_point_cloud(screen, points, center_x, center_y,
             elif pz < 0.5:  color = (0,   180,  80)
             elif pz < 1.5:  color = (255, 140,   0)
             else:           color = (80,  80,  255)
-            pygame.draw.circle(screen, color, (rx, ry), 2)
+            pygame.draw.circle(
+                screen, color, (rx, ry), 2
+            )
+
     pygame.draw.circle(
-        screen, (255, 100, 0), (center_x, center_y), 5
+        screen, (255, 80, 80), (center_x, center_y), 5
     )
-    title = font_s.render("LiDAR [PPO]", True, (200, 0, 0))
+    pygame.draw.circle(
+        screen, (255, 255, 255), (center_x, center_y), 2
+    )
+
+    title = font_s.render(
+        "LiDAR [PPO]", True, (200, 0, 0)
+    )
     screen.blit(title, (
         center_x - title.get_width()//2,
         center_y + size//2 + 4
     ))
 
+    legend = [
+        ((50,  50,  50),  "gnd"),
+        ((100, 100, 100), "low"),
+        ((0,   180,  80), "mid"),
+        ((255, 140,   0), "obj"),
+        ((80,  80,  255), "top"),
+    ]
+    lx = center_x - size//2 + 4
+    ly = center_y + size//2 - 75
+    for color, label in legend:
+        pygame.draw.circle(
+            screen, color, (lx+4, ly+4), 3
+        )
+        lbl = font_s.render(label, True, color)
+        screen.blit(lbl, (lx+10, ly))
+        ly += 14
+
 
 # ==========================================================
-# HUD
+# HUD — Red theme for PPO
 # ==========================================================
 def draw_hud(screen, font, info, total_steps, episode,
              ep_reward, rollout_steps, traffic_preset,
              tl_mode, view, start_episode):
+    """Red-themed HUD for PPO."""
     lines = [
-        f"[PPO] Episode  : {episode} (+{episode-start_episode})",
+        f"[PPO] Ep    : {episode} (+{episode-start_episode})",
         f"Step        : {info.get('step', 0)}",
         f"Total Steps : {total_steps}",
         f"Ep Reward   : {ep_reward:.1f}",
@@ -216,13 +275,16 @@ def draw_hud(screen, font, info, total_steps, episode,
         f"Traffic     : {traffic_preset}",
         f"Lights      : {tl_mode}",
         f"View        : {view}",
-        f"Map         : {str(info.get('map','?')).split('/')[-1]}",
+        f"Map         : "
+        f"{str(info.get('map','?')).split('/')[-1]}",
     ]
+
     surf = pygame.Surface(
         (260, len(lines)*22+10), pygame.SRCALPHA
     )
-    surf.fill((30, 0, 0, 140))   # red tint for PPO
+    surf.fill((30, 0, 0, 140))
     screen.blit(surf, (5, 5))
+
     for i, line in enumerate(lines):
         txt = font.render(line, True, (255, 200, 200))
         screen.blit(txt, (10, 10+i*22))
@@ -265,9 +327,13 @@ agent = PPO(
     batch_size   = cfg.BATCH_SIZE,
 )
 
-# Resume if checkpoint exists
+# ==========================================================
+# RESUME
+# ==========================================================
 start_episode = 0
-latest_ep, path = find_latest_checkpoint(cfg.CHECKPOINT_DIR)
+latest_ep, path = find_latest_checkpoint(
+    cfg.CHECKPOINT_DIR
+)
 if latest_ep > 0:
     agent.load_model(path, id=latest_ep)
     start_episode = latest_ep
@@ -276,7 +342,7 @@ else:
     logger.info("PPO starting fresh")
 
 best_reward  = -1e9
-total_steps  = 0
+total_steps  = start_episode * 200
 current_view = "third_person"
 
 logger.info(f"Algorithm     : PPO (baseline)")
@@ -287,6 +353,9 @@ logger.info(f"Target end    : {cfg.MAX_EPISODES}")
 logger.info(f"LR            : {cfg.LR}")
 logger.info(f"Rollout size  : {cfg.ROLLOUT_SIZE}")
 logger.info(f"PPO epochs    : {cfg.PPO_EPOCHS}")
+logger.info(f"Clip epsilon  : {cfg.CLIP_EPSILON}")
+logger.info(f"Lights ON     : episode 400")
+logger.info(f"Heavy traffic : episode 800")
 
 # ==========================================================
 # TRAINING LOOP
@@ -307,9 +376,9 @@ try:
 
         state, _ = env.reset()
 
-        ep_reward  = 0.0
-        ep_info    = {}
-        ppo_metrics= None
+        ep_reward   = 0.0
+        ep_info     = {}
+        ppo_metrics = None
 
         for step in range(cfg.MAX_STEPS):
 
@@ -323,16 +392,24 @@ try:
 
             if keys[pygame.K_1]:
                 current_view = "third_person"
-                env.unwrapped.set_camera_view(current_view)
+                env.unwrapped.set_camera_view(
+                    current_view
+                )
             elif keys[pygame.K_2]:
                 current_view = "driver"
-                env.unwrapped.set_camera_view(current_view)
+                env.unwrapped.set_camera_view(
+                    current_view
+                )
             elif keys[pygame.K_3]:
                 current_view = "front"
-                env.unwrapped.set_camera_view(current_view)
+                env.unwrapped.set_camera_view(
+                    current_view
+                )
             elif keys[pygame.K_4]:
                 current_view = "bird_eye"
-                env.unwrapped.set_camera_view(current_view)
+                env.unwrapped.set_camera_view(
+                    current_view
+                )
 
             if keys[pygame.K_5]:
                 env.unwrapped.set_spectator_mode("follow")
@@ -345,7 +422,8 @@ try:
                 break
 
             # PPO: get action + value + log_prob
-            action, value, log_prob = agent.sample_action(state)
+            action, value, log_prob = \
+                agent.sample_action(state)
 
             next_state, reward, done, trunc, info = \
                 env.step(action)
@@ -361,7 +439,7 @@ try:
                 value, log_prob, float(done or trunc)
             )
 
-            # PPO update when rollout is full
+            # PPO update when rollout full
             if agent.ready_to_update():
                 ppo_metrics = agent.update(next_state)
 
@@ -373,8 +451,12 @@ try:
             # Render
             frame = env.unwrapped.get_camera_frame()
             if frame is not None:
-                cam_tf = env.unwrapped.get_camera_transform()
-                K      = env.unwrapped.get_camera_intrinsic()
+                cam_tf = (
+                    env.unwrapped.get_camera_transform()
+                )
+                K = (
+                    env.unwrapped.get_camera_intrinsic()
+                )
                 if cam_tf is not None and K is not None:
                     waypoints = get_future_waypoints(
                         env.unwrapped.vehicle,
@@ -398,7 +480,9 @@ try:
             )
 
             if env.unwrapped._lidar is not None:
-                points = env.unwrapped._lidar.get_points()
+                points = (
+                    env.unwrapped._lidar.get_points()
+                )
                 draw_point_cloud(
                     screen, points,
                     center_x  = cfg.WIDTH  - 100,
@@ -413,7 +497,7 @@ try:
             if done or trunc:
                 break
 
-        # Logging
+        # Episode logging
         writer.add_scalar(
             "reward/episode",     ep_reward, episode)
         writer.add_scalar(
@@ -424,33 +508,59 @@ try:
         if ppo_metrics:
             writer.add_scalar(
                 "loss/actor",
-                np.mean(ppo_metrics["actor_loss"]), episode)
+                np.mean(ppo_metrics["actor_loss"]),
+                episode
+            )
             writer.add_scalar(
                 "loss/critic",
-                np.mean(ppo_metrics["critic_loss"]), episode)
+                np.mean(ppo_metrics["critic_loss"]),
+                episode
+            )
             writer.add_scalar(
                 "loss/entropy",
-                np.mean(ppo_metrics["entropy"]), episode)
+                np.mean(ppo_metrics["entropy"]),
+                episode
+            )
+
+        for key in [
+            "forward_progress", "lane_center",
+            "yaw_align", "curve_reward", "collision",
+            "off_road", "stuck", "red_light",
+            "wrong_lane", "wrong_way", "comfort",
+            "proximity_reward",
+        ]:
+            if key in ep_info:
+                writer.add_scalar(
+                    f"reward/{key}",
+                    ep_info[key], episode
+                )
 
         logger.info(
-            f"Ep {episode:04d} (+{episode-start_episode:04d}) | "
+            f"Ep {episode:04d} "
+            f"(+{episode-start_episode:04d}) | "
             f"Reward {ep_reward:8.2f} | "
             f"Steps {step+1:4d} | "
             f"Traffic {traffic_preset:6s} | "
+            f"Lights {tl_mode:3s} | "
             f"Done: {ep_info.get('term_reason','trunc')}"
         )
 
         if episode % cfg.SAVE_EVERY == 0:
-            agent.save_model(cfg.CHECKPOINT_DIR, id=episode)
+            agent.save_model(
+                cfg.CHECKPOINT_DIR, id=episode
+            )
             logger.info(
-                f"[PPO] Checkpoint saved — episode {episode}"
+                f"[PPO] Checkpoint — episode {episode}"
             )
 
         if ep_reward > best_reward:
             best_reward = ep_reward
-            agent.save_model(cfg.CHECKPOINT_DIR, id=9999)
+            agent.save_model(
+                cfg.CHECKPOINT_DIR, id=9999
+            )
             logger.info(
-                f"[PPO] New best — reward {best_reward:.2f}"
+                f"[PPO] New best — "
+                f"reward {best_reward:.2f}"
             )
 
 except KeyboardInterrupt:
