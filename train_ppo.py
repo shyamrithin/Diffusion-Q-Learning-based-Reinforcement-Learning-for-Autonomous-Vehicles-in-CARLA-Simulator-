@@ -1,14 +1,19 @@
 # ==========================================================
 # train_ppo.py
-# PPO Baseline Training Script v2
+# PPO Baseline Training Script v3
 #
-# Changes from v1:
-#   - MAX_EPISODES = 1300 (matches SAC/DQL for comparison)
-#   - Curriculum scaled to 1300 episode budget:
-#     light at 200, medium at 500, heavy at 800
-#   - Traffic lights ON at 400 (was 1000)
-#   - total_steps accounts for resume offset
-#   - Reward logging keys added for TensorBoard
+# Changes from v2:
+#   - Early throttle bias added (< 15k steps)
+#     Prevents stuck during early exploration
+#     Same fix that helped SAC and DQL
+#   - ENT_COEF increased 0.01 → 0.05
+#     More entropy = more exploration
+#     Prevents policy collapsing to "stay still"
+#   - ROLLOUT_SIZE reduced 2048 → 1024
+#     More frequent updates
+#     Less stuck experience accumulated per update
+#   - total_steps offset on resume
+#   - Curriculum matched to SAC/DQL
 #
 # CARLA 0.9.16 | Gymnasium 1.3 | Python 3.10
 # ==========================================================
@@ -48,16 +53,25 @@ torch.set_float32_matmul_precision("medium")
 # ==========================================================
 class PPOConfig:
     """
-    PPO training configuration v2.
+    PPO training configuration v3.
+
+    Key fixes:
+      ROLLOUT_SIZE : 2048 → 1024
+        More frequent policy updates
+        Less stuck experience per update
+
+      ENT_COEF : 0.01 → 0.05
+        More exploration
+        Prevents policy collapse to stationary
+
+      Throttle bias < 15k steps:
+        Forces minimum throttle early
+        Prevents aggressive braking exploration
+
     Matched to SAC/DQL for fair comparison:
       MAX_EPISODES = 1300
       Same curriculum thresholds
       Same traffic light schedule
-
-    PPO-specific:
-      ROLLOUT_SIZE = 2048  (collect before update)
-      PPO_EPOCHS   = 10    (reuse each rollout)
-      No replay buffer — on-policy algorithm
     """
 
     WIDTH          = 800
@@ -67,7 +81,8 @@ class PPOConfig:
     MAX_EPISODES   = 1300
     MAX_STEPS      = 1000
 
-    ROLLOUT_SIZE   = 2048
+    # 🔥 Reduced rollout — more frequent updates
+    ROLLOUT_SIZE   = 1024
     BATCH_SIZE     = 256
     PPO_EPOCHS     = 10
     SAVE_EVERY     = 10
@@ -78,7 +93,8 @@ class PPOConfig:
     GRAD_NORM      = 0.5
     CLIP_EPSILON   = 0.2
     VF_COEF        = 0.5
-    ENT_COEF       = 0.01
+    # 🔥 Higher entropy — more exploration
+    ENT_COEF       = 0.05
     HIDDEN_DIM     = 256
 
     # Curriculum — matched to SAC/DQL
@@ -91,7 +107,7 @@ class PPOConfig:
 
     TRAFFIC_LIGHT_CURRICULUM = [
         (0,   "off"),
-        (400, "on"),
+        (700, "on"),
     ]
 
     CHECKPOINT_DIR = "checkpoints_ppo"
@@ -172,7 +188,6 @@ def draw_point_cloud(screen, points, center_x, center_y,
         (center_x, center_y-size//2),
         (center_x, center_y+size//2), 1
     )
-
     for offset in [-size//4, size//4]:
         pygame.draw.line(
             screen, (30, 0, 0),
@@ -295,7 +310,7 @@ def draw_hud(screen, font, info, total_steps, episode,
 # ==========================================================
 pygame.init()
 screen = pygame.display.set_mode((cfg.WIDTH, cfg.HEIGHT))
-pygame.display.set_caption("RLCarla — PPO Baseline")
+pygame.display.set_caption("RLCarla — PPO Baseline v3")
 clock  = pygame.time.Clock()
 font   = pygame.font.SysFont("monospace", 16)
 
@@ -345,7 +360,7 @@ best_reward  = -1e9
 total_steps  = start_episode * 200
 current_view = "third_person"
 
-logger.info(f"Algorithm     : PPO (baseline)")
+logger.info(f"Algorithm     : PPO v3 (baseline)")
 logger.info(f"Device        : {cfg.DEVICE}")
 logger.info(f"Obs dim       : {OBS_DIM}")
 logger.info(f"Start episode : {start_episode}")
@@ -353,8 +368,10 @@ logger.info(f"Target end    : {cfg.MAX_EPISODES}")
 logger.info(f"LR            : {cfg.LR}")
 logger.info(f"Rollout size  : {cfg.ROLLOUT_SIZE}")
 logger.info(f"PPO epochs    : {cfg.PPO_EPOCHS}")
+logger.info(f"Ent coef      : {cfg.ENT_COEF}")
 logger.info(f"Clip epsilon  : {cfg.CLIP_EPSILON}")
-logger.info(f"Lights ON     : episode 400")
+logger.info(f"Throttle bias : < 15k steps")
+logger.info(f"Lights ON     : episode 700")
 logger.info(f"Heavy traffic : episode 800")
 
 # ==========================================================
@@ -424,6 +441,13 @@ try:
             # PPO: get action + value + log_prob
             action, value, log_prob = \
                 agent.sample_action(state)
+
+            # 🔥 Early throttle bias
+            # Prevents stuck during early exploration
+            # PPO entropy explores brake aggressively
+            if total_steps < 15000:
+                action[0] = max(action[0], 0.4)
+                action[2] = min(action[2], 0.1)
 
             next_state, reward, done, trunc, info = \
                 env.step(action)
@@ -542,6 +566,7 @@ try:
             f"Steps {step+1:4d} | "
             f"Traffic {traffic_preset:6s} | "
             f"Lights {tl_mode:3s} | "
+            f"Buffer {agent._step:4d} | "
             f"Done: {ep_info.get('term_reason','trunc')}"
         )
 
@@ -573,4 +598,4 @@ finally:
     writer.close()
     env.close()
     pygame.quit()
-    logger.info("PPO training finished.")
+    logger.info("PPO v3 training finished.")
