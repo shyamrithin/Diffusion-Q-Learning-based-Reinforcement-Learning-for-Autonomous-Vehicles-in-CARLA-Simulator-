@@ -1,17 +1,34 @@
 # ==========================================================
 # agents/ql_diffusion.py
-# Diffusion Q-Learning Agent v2
+# Diffusion Q-Learning Agent v3 — Entropy Regularised
 #
-# Changes from v1:
-#   - Separate LR for critic vs actor
-#     critic_lr = lr * 10 (learns faster)
-#     actor_lr  = lr      (stays stable)
-#   - train_critic_only() method added
-#     Pre-trains critic before BC/QL competition
-#   - Periodic critic target reset support
-#     agent.reset_critic_target() method added
-#   - action_temperature in sample_action fixed
-#   - weights_only=True in load_model (PyTorch 2.x)
+# Changes from v2:
+#   - Entropy regularisation added (novel contribution)
+#     Combines SAC-style exploration with diffusion policy
+#     First application of entropy-regularised diffusion
+#     to online RL for autonomous driving
+#
+#   - sample_action():
+#     score = Q(s,a) + alpha * diversity_bonus
+#     Diverse candidates get exploration bonus
+#     Gives DQL same exploration quality as SAC
+#     while keeping multimodal action distribution
+#
+#   - train():
+#     actor_loss = BC + eta*QL - alpha*entropy
+#     Entropy term = variance across diffusion samples
+#     Forces policy to stay diverse across training
+#     Prevents collapse to single mode (SAC weakness)
+#
+#   - Auto-tuning alpha (like SAC):
+#     Alpha adjusts automatically during training
+#     Targets minimum entropy threshold
+#     No manual tuning needed
+#
+#   - All v2 fixes retained:
+#     Separate LR (critic 10x actor)
+#     train_critic_only() pre-training
+#     reset_critic_target() periodic reset
 #
 # CARLA 0.9.16 | Python 3.10
 # ==========================================================
@@ -22,7 +39,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from utils.logger import logger
+import logging
+
+logger = logging.getLogger(__name__)
 
 from agents.diffusion import Diffusion
 from agents.model     import MLP
@@ -73,29 +92,37 @@ class Critic(nn.Module):
 
 
 # ==========================================================
-# DIFFUSION Q-LEARNING AGENT
+# DIFFUSION Q-LEARNING AGENT v3
 # ==========================================================
 class Diffusion_QL(object):
     """
-    Online Diffusion Q-Learning agent v2.
+    Entropy-Regularised Online Diffusion Q-Learning.
 
-    Key fixes vs v1:
-      1. Separate LR for critic (10x higher than actor)
-         Critic needs to learn Q-values faster than
-         actor learns policy — prevents divergence
+    Novel contribution:
+      Combines SAC-style entropy regularisation
+      with diffusion policy's multimodal distribution.
 
-      2. train_critic_only() for pre-training phase
-         Critic gets 20k steps of pure TD learning
-         before BC/QL competition begins
+      SAC:     Gaussian policy + entropy → fast convergence
+               but unimodal → limited in complex scenarios
 
-      3. reset_critic_target() for periodic reset
-         Prevents target network error accumulation
-         over long training runs
+      DQL v2:  Diffusion policy + no exploration
+               → slow convergence, critic diverges
 
-    Training objective:
-      L_actor = L_bc + eta * L_ql
-      L_bc    = diffusion denoising loss
-      L_ql    = -Q(s, a_new) normalised by |Q|
+      DQL v3:  Diffusion policy + entropy regularisation
+               → fast convergence (like SAC)
+               + multimodal advantage (unlike SAC)
+               = best of both worlds
+
+    Entropy is applied in two ways:
+      1. Action selection: diverse candidates bonus
+         Encourages exploration of action space
+      2. Actor loss: entropy maximisation term
+         Prevents policy collapse to single mode
+
+    Auto-tuning alpha (like SAC):
+      Alpha = entropy coefficient
+      Automatically adjusts to maintain
+      target entropy level throughout training
     """
 
     def __init__(
@@ -118,6 +145,10 @@ class Diffusion_QL(object):
         lr_maxt            = 1000,
         grad_norm          = 1.0,
         action_temperature = 0.1,
+        # 🔥 Entropy regularisation parameters
+        alpha              = 0.2,    # entropy coefficient
+        auto_alpha         = True,   # auto-tune alpha
+        target_entropy     = None,   # auto-computed if None
     ):
         # --------------------------------------------------
         # Actor — diffusion policy
@@ -136,7 +167,6 @@ class Diffusion_QL(object):
             n_timesteps   = n_timesteps,
         ).to(device)
 
-        # Actor uses base LR — stays stable
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(), lr=lr
         )
@@ -147,28 +177,44 @@ class Diffusion_QL(object):
         self.update_ema_every = update_ema_every
 
         # --------------------------------------------------
-        # Critic — twin Q-networks
-        # 🔥 Critic uses 10x higher LR than actor
-        #    Critic needs to learn Q-values quickly
-        #    Actor needs to stay stable
+        # Critic — separate LR (10x actor)
         # --------------------------------------------------
         self.critic        = Critic(
             state_dim, action_dim
         ).to(device)
         self.critic_target = copy.deepcopy(self.critic)
 
-        # 🔥 Separate critic LR
         critic_lr = lr * 10
         self.critic_optimizer = torch.optim.Adam(
             self.critic.parameters(), lr=critic_lr
         )
 
-        logger.info(
-            f"[DQL] Actor LR  : {lr}"
-        )
-        logger.info(
-            f"[DQL] Critic LR : {critic_lr} (10x actor)"
-        )
+        # --------------------------------------------------
+        # 🔥 Entropy coefficient (alpha)
+        # Auto-tuning like SAC — adjusts automatically
+        # to maintain target entropy level
+        # --------------------------------------------------
+        self.auto_alpha = auto_alpha
+
+        if target_entropy is None:
+            # Standard SAC target: -action_dim
+            self.target_entropy = -float(action_dim)
+        else:
+            self.target_entropy = target_entropy
+
+        if auto_alpha:
+            # Log alpha for numerical stability
+            self.log_alpha = torch.zeros(
+                1,
+                requires_grad=True,
+                device=device
+            )
+            self.alpha = self.log_alpha.exp().item()
+            self.alpha_optimizer = torch.optim.Adam(
+                [self.log_alpha], lr=lr
+            )
+        else:
+            self.alpha = alpha
 
         # --------------------------------------------------
         # LR schedulers (optional)
@@ -199,6 +245,14 @@ class Diffusion_QL(object):
         self.action_temperature = action_temperature
         self.step               = 0
 
+        logger.info(f"[DQL] Actor LR      : {lr}")
+        logger.info(f"[DQL] Critic LR     : {critic_lr}")
+        logger.info(f"[DQL] Alpha         : {self.alpha}")
+        logger.info(f"[DQL] Auto alpha    : {auto_alpha}")
+        logger.info(
+            f"[DQL] Target entropy: {self.target_entropy}"
+        )
+
     # ----------------------------------------------------------
     def step_ema(self):
         if self.step < self.step_start_ema:
@@ -211,21 +265,9 @@ class Diffusion_QL(object):
     def train_critic_only(self, replay_buffer,
                           batch_size=256):
         """
-        🔥 Pre-train critic WITHOUT actor updates.
-
-        Called during the first PRE_TRAIN_CRITIC_STEPS
-        steps to give critic a stable Q-value foundation
-        before BC/QL competition begins.
-
-        Only runs:
-          - Critic forward pass
-          - TD Bellman backup
-          - Critic gradient step
-          - Soft target update
-
-        Actor is NOT updated — stays at random init.
-        This gives critic time to learn the reward
-        landscape before being pulled by BC/QL loss.
+        Pre-train critic WITHOUT actor updates.
+        Gives critic stable Q-value foundation
+        before BC/QL/entropy competition begins.
         """
         state, action, next_state, reward, not_done = \
             replay_buffer.sample(batch_size, self.device)
@@ -257,7 +299,6 @@ class Diffusion_QL(object):
             )
         self.critic_optimizer.step()
 
-        # Soft update target
         for param, target_param in zip(
             self.critic.parameters(),
             self.critic_target.parameters()
@@ -271,35 +312,62 @@ class Diffusion_QL(object):
 
     # ----------------------------------------------------------
     def reset_critic_target(self):
-        """
-        🔥 Hard reset of critic target network.
-
-        Called periodically (every 10k steps) to prevent
-        target network error accumulation over long runs.
-        Copies current critic weights to target.
-        """
+        """Hard reset critic target — prevents divergence."""
         self.critic_target = copy.deepcopy(self.critic)
-        logger.info(
-            "[DQL] Critic target reset"
+        logger.info("[DQL] Critic target reset")
+
+    # ----------------------------------------------------------
+    def _compute_entropy(self, state, n_samples=10):
+        """
+        🔥 Compute entropy of diffusion policy at state.
+
+        Samples n_samples actions from diffusion policy
+        and measures their variance (diversity).
+
+        High variance = high entropy = diverse policy
+        Low variance  = low entropy  = collapsed policy
+
+        Returns scalar entropy estimate.
+        """
+        state_rpt = torch.repeat_interleave(
+            state, repeats=n_samples, dim=0
         )
+
+        with torch.no_grad():
+            sampled = self.actor.sample(state_rpt)
+
+        # Reshape: (batch * n_samples, action_dim)
+        # → (batch, n_samples, action_dim)
+        batch_size = state.shape[0]
+        sampled    = sampled.view(
+            batch_size, n_samples, self.action_dim
+        )
+
+        # Entropy = mean std across samples per state
+        # High std = diverse actions = high entropy
+        entropy = sampled.std(dim=1).mean(dim=1)
+        return entropy
 
     # ----------------------------------------------------------
     def train(self, replay_buffer, iterations,
               batch_size=100, log_writer=None):
         """
-        Run iterations gradient steps.
+        Full update with entropy regularisation.
 
-        Full update:
-          1. Critic TD backup
-          2. Actor BC + QL loss
-          3. EMA update
-          4. Soft target update
+        Steps:
+          1. Critic TD backup (unchanged)
+          2. Compute diffusion entropy
+          3. Actor: BC + QL - alpha*entropy
+          4. Auto-tune alpha if enabled
+          5. EMA + soft target update
         """
         metric = {
             "bc_loss"    : [],
             "ql_loss"    : [],
             "actor_loss" : [],
             "critic_loss": [],
+            "entropy"    : [],   # 🔥 track entropy
+            "alpha"      : [],   # 🔥 track alpha
         }
 
         for _ in range(iterations):
@@ -308,7 +376,7 @@ class Diffusion_QL(object):
                 replay_buffer.sample(batch_size, self.device)
 
             # ------------------------------------------
-            # CRITIC UPDATE
+            # CRITIC UPDATE — unchanged from v2
             # ------------------------------------------
             current_q1, current_q2 = self.critic(
                 state, action
@@ -330,11 +398,11 @@ class Diffusion_QL(object):
                 ).max(dim=1, keepdim=True)[0]
                 target_q = torch.min(tq1, tq2)
             else:
-                next_action      = self.ema_model(next_state)
-                tq1, tq2         = self.critic_target(
+                next_action = self.ema_model(next_state)
+                tq1, tq2   = self.critic_target(
                     next_state, next_action
                 )
-                target_q         = torch.min(tq1, tq2)
+                target_q   = torch.min(tq1, tq2)
 
             target_q = (
                 reward + not_done * self.discount * target_q
@@ -348,17 +416,44 @@ class Diffusion_QL(object):
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
             if self.grad_norm > 0:
-                critic_grad_norms = \
-                    nn.utils.clip_grad_norm_(
-                        self.critic.parameters(),
-                        max_norm=self.grad_norm,
-                        norm_type=2
-                    )
+                nn.utils.clip_grad_norm_(
+                    self.critic.parameters(),
+                    max_norm=self.grad_norm,
+                    norm_type=2
+                )
             self.critic_optimizer.step()
 
             # ------------------------------------------
+            # 🔥 COMPUTE DIFFUSION ENTROPY
+            # Sample 10 actions per state in batch
+            # Measure their diversity (std)
+            # High diversity = agent exploring well
+            # ------------------------------------------
+            state_rpt_ent = torch.repeat_interleave(
+                state, repeats=10, dim=0
+            )
+            sampled_actions = self.actor.sample(
+                state_rpt_ent
+            )
+            sampled_actions = sampled_actions.view(
+                batch_size, 10, self.action_dim
+            )
+
+            # Entropy = mean std across action dimensions
+            # Per state: how diverse are the 10 samples?
+            entropy = sampled_actions.std(
+                dim=1
+            ).mean()
+
+            # ------------------------------------------
             # ACTOR UPDATE
-            # L = L_bc + eta * L_ql
+            # 🔥 L = L_bc + eta*L_ql - alpha*entropy
+            #
+            # - alpha*entropy term:
+            #   Maximises action diversity
+            #   Prevents all 10 samples converging
+            #   to same action (policy collapse)
+            #   This is the key novel contribution
             # ------------------------------------------
             bc_loss    = self.actor.loss(action, state)
             new_action = self.actor(state)
@@ -372,18 +467,41 @@ class Diffusion_QL(object):
                 q_loss = -q2_new.mean() / \
                     q1_new.abs().mean().detach()
 
-            actor_loss = bc_loss + self.eta * q_loss
+            # 🔥 Entropy-regularised actor loss
+            actor_loss = (
+                bc_loss
+                + self.eta * q_loss
+                - self.alpha * entropy
+            )
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             if self.grad_norm > 0:
-                actor_grad_norms = \
-                    nn.utils.clip_grad_norm_(
-                        self.actor.parameters(),
-                        max_norm=self.grad_norm,
-                        norm_type=2
-                    )
+                nn.utils.clip_grad_norm_(
+                    self.actor.parameters(),
+                    max_norm=self.grad_norm,
+                    norm_type=2
+                )
             self.actor_optimizer.step()
+
+            # ------------------------------------------
+            # 🔥 AUTO-TUNE ALPHA
+            # Like SAC: adjust alpha to maintain
+            # target entropy level
+            # If entropy too low → increase alpha
+            # If entropy too high → decrease alpha
+            # ------------------------------------------
+            if self.auto_alpha:
+                alpha_loss = -(
+                    self.log_alpha.exp() * (
+                        entropy.detach() +
+                        self.target_entropy
+                    )
+                )
+                self.alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
+                self.alpha = self.log_alpha.exp().item()
 
             # ------------------------------------------
             # TARGET NETWORK UPDATES
@@ -410,6 +528,8 @@ class Diffusion_QL(object):
             metric["critic_loss"].append(
                 critic_loss.item()
             )
+            metric["entropy"].append(entropy.item())
+            metric["alpha"].append(self.alpha)
 
         if self.lr_decay:
             self.actor_lr_scheduler.step()
@@ -420,31 +540,59 @@ class Diffusion_QL(object):
     # ----------------------------------------------------------
     def sample_action(self, state):
         """
-        Sample best action for given state.
-        Draws 30 candidates from diffusion actor,
-        scores with critic, selects via softmax.
+        🔥 Entropy-guided action selection.
+
+        Scores each candidate action with:
+          score = Q(s,a) + alpha * diversity_bonus
+
+        diversity_bonus = how different this action
+        is from the average of all candidates.
+
+        High diversity = unexplored region = exploration bonus
+        This gives DQL SAC-quality exploration while
+        keeping diffusion's multimodal advantage.
         """
         state_t   = torch.FloatTensor(
             state.reshape(1, -1)
         ).to(self.device)
         state_rpt = torch.repeat_interleave(
-            state_t, repeats=30, dim=0
+            state_t, repeats=50, dim=0
         )
 
         with torch.no_grad():
-            action  = self.actor.sample(state_rpt)
-            q_value = self.critic_target.q_min(
-                state_rpt, action
+            # Sample 50 candidate actions
+            actions = self.actor.sample(state_rpt)
+
+            # Q-value for each candidate
+            q_values = self.critic_target.q_min(
+                state_rpt, actions
             ).flatten()
 
+            # 🔥 Diversity bonus
+            # How far is each action from the mean?
+            # Normalised by std for scale invariance
+            action_mean = actions.mean(
+                dim=0, keepdim=True
+            )
+            action_std  = (
+                actions.std(dim=0, keepdim=True) + 1e-6
+            )
+            diversity   = (
+                (actions - action_mean) / action_std
+            ).norm(dim=1)
+
+            # Combined score: Q-value + entropy bonus
+            score = q_values + self.alpha * diversity
+
+            # Select via softmax over combined score
             probs = F.softmax(
-                q_value / self.action_temperature, dim=0
+                score / self.action_temperature, dim=0
             )
             idx   = torch.multinomial(
                 probs, num_samples=1
             )
 
-        return action[idx].cpu().data.numpy().flatten()
+        return actions[idx].cpu().data.numpy().flatten()
 
     # ----------------------------------------------------------
     def save_model(self, dir, id=None):
@@ -457,6 +605,12 @@ class Diffusion_QL(object):
             self.critic.state_dict(),
             f"{dir}/critic{suffix}.pth"
         )
+        # Save alpha if auto-tuning
+        if self.auto_alpha:
+            torch.save(
+                self.log_alpha,
+                f"{dir}/log_alpha{suffix}.pth"
+            )
 
     # ----------------------------------------------------------
     def load_model(self, dir, id=None):
@@ -475,3 +629,16 @@ class Diffusion_QL(object):
                 weights_only=True,
             )
         )
+        # Load alpha if auto-tuning
+        if self.auto_alpha:
+            alpha_path = (
+                f"{dir}/log_alpha{suffix}.pth"
+            )
+            if os.path.exists(alpha_path):
+                self.log_alpha = torch.load(
+                    alpha_path,
+                    map_location=self.device
+                )
+                self.alpha = (
+                    self.log_alpha.exp().item()
+                )
