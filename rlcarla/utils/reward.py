@@ -37,15 +37,15 @@ import carla
 # ==========================================================
 W = {
     # Core locomotion
-    "forward_progress"    :  1.0,
+    "forward_progress"    :  1.5,
     "raw_speed"           :  0.2,
     "speed_target"        :  1.0,
 
     # Lane discipline — PRIMARY signals
-    "lane_center"         :  2.5,
-    "lane_offset_penalty" :  6.0,
+    "lane_center"         :  5.0,
+    "lane_offset_penalty" : 10.0,
     "yaw_align"           :  2.0,
-    "yaw_penalty"         :  8.0,
+    "yaw_penalty"         : 12.0,
 
     # Curve following
     "curve_steer_penalty" :  8.0,
@@ -60,7 +60,7 @@ W = {
 
     # Safety
     "collision"           : 50.0,
-    "off_road"            : 20.0,
+    "off_road"            : 35.0,
     "wrong_lane"          : 40.0,
     "wrong_way"           : 30.0,
     "stuck"               :  0.5,

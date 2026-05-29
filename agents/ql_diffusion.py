@@ -34,6 +34,7 @@
 # ==========================================================
 
 import copy
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -184,7 +185,7 @@ class Diffusion_QL(object):
         ).to(device)
         self.critic_target = copy.deepcopy(self.critic)
 
-        critic_lr = lr * 10
+        critic_lr = lr * 3
         self.critic_optimizer = torch.optim.Adam(
             self.critic.parameters(), lr=critic_lr
         )

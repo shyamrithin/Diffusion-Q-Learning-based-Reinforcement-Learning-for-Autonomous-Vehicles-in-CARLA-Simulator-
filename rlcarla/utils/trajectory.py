@@ -78,8 +78,8 @@ def draw_trajectory(
     img_h,
     color      = (0, 220, 0),
     thickness  = 3,
-    dot_radius = 5,
-    max_points = 20,
+    dot_radius = 4,
+    max_points = 30,
 ):
     extrinsic = get_camera_extrinsic(camera_transform)
 
@@ -112,7 +112,7 @@ def draw_trajectory(
     return image
 
 
-def get_future_waypoints(vehicle, carla_map, n=20, spacing=3.0):
+def get_future_waypoints(vehicle, carla_map, n=30, spacing=2.0):
     loc = vehicle.get_location()
     tf  = vehicle.get_transform()
 
@@ -123,10 +123,10 @@ def get_future_waypoints(vehicle, carla_map, n=20, spacing=3.0):
         z = loc.z
     )
 
-    wp = carla_map.get_waypoint(ahead_loc, project_to_road=True)
+    wp = carla_map.get_waypoint(ahead_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
 
     if wp is None:
-        wp = carla_map.get_waypoint(loc, project_to_road=True)
+        wp = carla_map.get_waypoint(loc, project_to_road=True, lane_type=carla.LaneType.Driving)
 
     if wp is None:
         return []

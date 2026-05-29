@@ -1,6 +1,6 @@
 # ==========================================================
 # train_diffusion.py
-# RLCarla Training Script v8 — Entropy-Regularised DQL
+# RLCarla Training Script v10 — Entropy-Regularised DQL
 #
 # Changes from v7:
 #   - auto_alpha=True passed to agent
@@ -60,7 +60,7 @@ torch.set_float32_matmul_precision("medium")
 # ==========================================================
 class TrainConfig:
     """
-    Diffusion-QL v8 — Entropy-Regularised.
+    Diffusion-QL v10 — Entropy-Regularised.
 
     Key additions vs v7:
       ALPHA      = 0.2  (entropy coefficient)
@@ -82,7 +82,7 @@ class TrainConfig:
     HEIGHT         = 450
     FPS            = 20
 
-    MAX_EPISODES          = 1300
+    MAX_EPISODES          = 1500
     MAX_STEPS             = 1000
 
     START_RANDOM_STEPS    = 10000
@@ -101,23 +101,23 @@ class TrainConfig:
     BETA_SCHEDULE         = "vp"
     N_TIMESTEPS           = 3
     LR                    = 3e-5
-    GRAD_NORM             = 0.1
-    ACTION_TEMPERATURE    = 0.1
+    GRAD_NORM             = 0.05
+    ACTION_TEMPERATURE    = 0.05
 
     # 🔥 Entropy regularisation
     ALPHA      = 0.2    # initial entropy coefficient
     AUTO_ALPHA = True   # auto-tune like SAC
 
     # Critic pre-training
-    PRE_TRAIN_CRITIC_STEPS = 20000
+    PRE_TRAIN_CRITIC_STEPS = 30000
 
     # ETA scheduling
     ETA_START  = 0.0
-    ETA_END    = 0.001
-    ETA_WARMUP = 50000
+    ETA_END    = 0.0005
+    ETA_WARMUP = 70000
 
     # Periodic critic target reset
-    CRITIC_RESET_FREQ = 10000
+    CRITIC_RESET_FREQ = 7000
 
     # Curriculum — matched to SAC/PPO
     CURRICULUM = [
@@ -133,7 +133,7 @@ class TrainConfig:
     ]
 
     CHECKPOINT_DIR = "checkpoints"
-    LOG_DIR        = "runs/rlcarla"
+    LOG_DIR        = "runs/rlcarla_v10"
     DEVICE = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -286,7 +286,7 @@ def choose_action(agent, state, prev_action,
         return random_action()
 
     # Throttle bias after pre-training
-    if total_steps < cfg.PRE_TRAIN_CRITIC_STEPS + 10000:
+    if total_steps < cfg.PRE_TRAIN_CRITIC_STEPS + 50000:
         raw[0] = max(raw[0], 0.4)
         raw[2] = min(raw[2], 0.1)
 
@@ -487,7 +487,7 @@ def draw_hud(screen, font, info, total_steps, episode,
 pygame.init()
 screen = pygame.display.set_mode((cfg.WIDTH, cfg.HEIGHT))
 pygame.display.set_caption(
-    "RLCarla — Entropy-Regularised DQL v8"
+    "RLCarla — Entropy-Regularised DQL v10"
 )
 clock  = pygame.time.Clock()
 font   = pygame.font.SysFont("monospace", 16)
@@ -536,7 +536,7 @@ current_view    = "third_person"
 current_alpha   = cfg.ALPHA
 current_entropy = 0.0
 
-logger.info(f"Algorithm        : DQL v8 (Entropy-Reg)")
+logger.info(f"Algorithm        : DQL v10 (Entropy-Reg)")
 logger.info(f"Device           : {cfg.DEVICE}")
 logger.info(f"Obs dim          : {OBS_DIM}")
 logger.info(f"Start episode    : {start_episode}")
@@ -844,4 +844,4 @@ finally:
     writer.close()
     env.close()
     pygame.quit()
-    logger.info("DQL v8 training finished.")
+    logger.info("DQL v10 training finished.")
