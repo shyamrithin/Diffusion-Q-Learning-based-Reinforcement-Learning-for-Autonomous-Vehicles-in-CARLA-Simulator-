@@ -185,7 +185,7 @@ class Diffusion_QL(object):
         ).to(device)
         self.critic_target = copy.deepcopy(self.critic)
 
-        critic_lr = lr * 3
+        critic_lr = lr * 2
         self.critic_optimizer = torch.optim.Adam(
             self.critic.parameters(), lr=critic_lr
         )

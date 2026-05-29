@@ -178,7 +178,8 @@ class RewardCalculator:
         if wp is None:
             reward -= W["off_road"]
             info["off_road"] = -W["off_road"]
-            return float(reward), info
+            reward = float(np.clip(reward, -15.0, 15.0))
+            return reward, info
 
         lane_center  = wp.transform.location
         lane_yaw     = wp.transform.rotation.yaw
@@ -465,7 +466,8 @@ class RewardCalculator:
         self.prev_brake    = brake
         self.prev_speed    = speed
 
-        return float(reward), info
+        reward = float(np.clip(reward, -15.0, 15.0))
+        return reward, info
 
 
 # ==========================================================
