@@ -1,32 +1,35 @@
 # ==========================================================
 # agents/ql_diffusion.py
-# Diffusion Q-Learning Agent v3 — Entropy Regularised
+# Diffusion Q-Learning Agent v14 — Entropy Regularised
+#                                  + Reward Scaling
 #
-# Changes from v2:
-#   - Entropy regularisation added (novel contribution)
-#     Combines SAC-style exploration with diffusion policy
-#     First application of entropy-regularised diffusion
-#     to online RL for autonomous driving
+# Changes from v11/v13:
+#   - REWARD SCALING added (self.reward_scale, default 0.1)
+#     Rationale: with gamma=0.99 and reward in [-15,15],
+#     the value function magnitude reaches ~15/(1-0.99)
+#     = 1500. MSE critic loss on Q-values of that scale
+#     produces loss numbers in the thousands even when
+#     the critic is only a few percent off. This is value
+#     SCALE, not instability. Scaling rewards by 0.1 brings
+#     Q-values to ~150 and critic loss into the tens/
+#     hundreds, giving gentler TD targets and smoother
+#     gradients. Applied ONLY inside the TD target — the
+#     logged reward and reward function are unchanged so
+#     reward curves stay interpretable.
 #
-#   - sample_action():
-#     score = Q(s,a) + alpha * diversity_bonus
-#     Diverse candidates get exploration bonus
-#     Gives DQL same exploration quality as SAC
-#     while keeping multimodal action distribution
+#   - CONSERVATIVE (CQL) TERM REMOVED. CQL is an offline-RL
+#     method; in the online setting (expanding replay
+#     distribution) its suppression of OOD-action Q-values
+#     fought the bellman update and made the critic loss
+#     diverge worse (v13). Reverted.
 #
-#   - train():
+#   - All v3 entropy-regularisation retained:
 #     actor_loss = BC + eta*QL - alpha*entropy
-#     Entropy term = variance across diffusion samples
-#     Forces policy to stay diverse across training
-#     Prevents collapse to single mode (SAC weakness)
+#     auto-tuning alpha (SAC-style)
+#     entropy-guided action selection
 #
-#   - Auto-tuning alpha (like SAC):
-#     Alpha adjusts automatically during training
-#     Targets minimum entropy threshold
-#     No manual tuning needed
-#
-#   - All v2 fixes retained:
-#     Separate LR (critic 10x actor)
+#   - All v2 stability fixes retained:
+#     Separate critic LR (2x actor)
 #     train_critic_only() pre-training
 #     reset_critic_target() periodic reset
 #
@@ -93,37 +96,28 @@ class Critic(nn.Module):
 
 
 # ==========================================================
-# DIFFUSION Q-LEARNING AGENT v3
+# DIFFUSION Q-LEARNING AGENT v14
 # ==========================================================
 class Diffusion_QL(object):
     """
-    Entropy-Regularised Online Diffusion Q-Learning.
+    Entropy-Regularised Online Diffusion Q-Learning
+    with reward scaling for value-scale control.
 
     Novel contribution:
-      Combines SAC-style entropy regularisation
-      with diffusion policy's multimodal distribution.
-
-      SAC:     Gaussian policy + entropy → fast convergence
-               but unimodal → limited in complex scenarios
-
-      DQL v2:  Diffusion policy + no exploration
-               → slow convergence, critic diverges
-
-      DQL v3:  Diffusion policy + entropy regularisation
-               → fast convergence (like SAC)
-               + multimodal advantage (unlike SAC)
-               = best of both worlds
+      Combines SAC-style entropy regularisation with
+      diffusion policy's multimodal action distribution
+      for online autonomous-driving RL.
 
     Entropy is applied in two ways:
       1. Action selection: diverse candidates bonus
-         Encourages exploration of action space
       2. Actor loss: entropy maximisation term
-         Prevents policy collapse to single mode
 
-    Auto-tuning alpha (like SAC):
-      Alpha = entropy coefficient
-      Automatically adjusts to maintain
-      target entropy level throughout training
+    Reward scaling:
+      Rewards are scaled by self.reward_scale inside the
+      TD target only, keeping value magnitudes (and thus
+      critic-loss magnitudes and TD-target gradients) in
+      a numerically gentle range. The actor's normalised
+      Q-loss ratio is scale-invariant, so it is unaffected.
     """
 
     def __init__(
@@ -146,10 +140,12 @@ class Diffusion_QL(object):
         lr_maxt            = 1000,
         grad_norm          = 1.0,
         action_temperature = 0.1,
-        # 🔥 Entropy regularisation parameters
+        # Entropy regularisation parameters
         alpha              = 0.2,    # entropy coefficient
         auto_alpha         = True,   # auto-tune alpha
         target_entropy     = None,   # auto-computed if None
+        # Reward scaling parameter
+        reward_scale       = 0.1,    # scales TD-target reward
     ):
         # --------------------------------------------------
         # Actor — diffusion policy
@@ -178,7 +174,7 @@ class Diffusion_QL(object):
         self.update_ema_every = update_ema_every
 
         # --------------------------------------------------
-        # Critic — separate LR (10x actor)
+        # Critic — separate LR (2x actor)
         # --------------------------------------------------
         self.critic        = Critic(
             state_dim, action_dim
@@ -191,20 +187,21 @@ class Diffusion_QL(object):
         )
 
         # --------------------------------------------------
-        # 🔥 Entropy coefficient (alpha)
-        # Auto-tuning like SAC — adjusts automatically
-        # to maintain target entropy level
+        # Reward scaling (value-scale control)
+        # --------------------------------------------------
+        self.reward_scale = reward_scale
+
+        # --------------------------------------------------
+        # Entropy coefficient (alpha) — auto-tuning
         # --------------------------------------------------
         self.auto_alpha = auto_alpha
 
         if target_entropy is None:
-            # Standard SAC target: -action_dim
             self.target_entropy = -float(action_dim)
         else:
             self.target_entropy = target_entropy
 
         if auto_alpha:
-            # Log alpha for numerical stability
             self.log_alpha = torch.zeros(
                 1,
                 requires_grad=True,
@@ -250,6 +247,7 @@ class Diffusion_QL(object):
         logger.info(f"[DQL] Critic LR     : {critic_lr}")
         logger.info(f"[DQL] Alpha         : {self.alpha}")
         logger.info(f"[DQL] Auto alpha    : {auto_alpha}")
+        logger.info(f"[DQL] Reward scale  : {self.reward_scale}")
         logger.info(
             f"[DQL] Target entropy: {self.target_entropy}"
         )
@@ -269,6 +267,7 @@ class Diffusion_QL(object):
         Pre-train critic WITHOUT actor updates.
         Gives critic stable Q-value foundation
         before BC/QL/entropy competition begins.
+        Reward is scaled in the TD target.
         """
         state, action, next_state, reward, not_done = \
             replay_buffer.sample(batch_size, self.device)
@@ -279,7 +278,8 @@ class Diffusion_QL(object):
                 next_state, next_action
             )
             target_q = (
-                reward + not_done * self.discount *
+                self.reward_scale * reward
+                + not_done * self.discount *
                 torch.min(tq1, tq2)
             )
 
@@ -320,15 +320,9 @@ class Diffusion_QL(object):
     # ----------------------------------------------------------
     def _compute_entropy(self, state, n_samples=10):
         """
-        🔥 Compute entropy of diffusion policy at state.
-
-        Samples n_samples actions from diffusion policy
-        and measures their variance (diversity).
-
-        High variance = high entropy = diverse policy
-        Low variance  = low entropy  = collapsed policy
-
-        Returns scalar entropy estimate.
+        Compute entropy of diffusion policy at state.
+        Samples n_samples actions and measures variance.
+        High variance = high entropy = diverse policy.
         """
         state_rpt = torch.repeat_interleave(
             state, repeats=n_samples, dim=0
@@ -337,15 +331,11 @@ class Diffusion_QL(object):
         with torch.no_grad():
             sampled = self.actor.sample(state_rpt)
 
-        # Reshape: (batch * n_samples, action_dim)
-        # → (batch, n_samples, action_dim)
         batch_size = state.shape[0]
         sampled    = sampled.view(
             batch_size, n_samples, self.action_dim
         )
 
-        # Entropy = mean std across samples per state
-        # High std = diverse actions = high entropy
         entropy = sampled.std(dim=1).mean(dim=1)
         return entropy
 
@@ -354,9 +344,10 @@ class Diffusion_QL(object):
               batch_size=100, log_writer=None):
         """
         Full update with entropy regularisation.
+        Reward is scaled in the TD target only.
 
         Steps:
-          1. Critic TD backup (unchanged)
+          1. Critic TD backup (scaled reward)
           2. Compute diffusion entropy
           3. Actor: BC + QL - alpha*entropy
           4. Auto-tune alpha if enabled
@@ -367,8 +358,8 @@ class Diffusion_QL(object):
             "ql_loss"    : [],
             "actor_loss" : [],
             "critic_loss": [],
-            "entropy"    : [],   # 🔥 track entropy
-            "alpha"      : [],   # 🔥 track alpha
+            "entropy"    : [],
+            "alpha"      : [],
         }
 
         for _ in range(iterations):
@@ -377,7 +368,7 @@ class Diffusion_QL(object):
                 replay_buffer.sample(batch_size, self.device)
 
             # ------------------------------------------
-            # CRITIC UPDATE — unchanged from v2
+            # CRITIC UPDATE — scaled-reward TD target
             # ------------------------------------------
             current_q1, current_q2 = self.critic(
                 state, action
@@ -406,7 +397,8 @@ class Diffusion_QL(object):
                 target_q   = torch.min(tq1, tq2)
 
             target_q = (
-                reward + not_done * self.discount * target_q
+                self.reward_scale * reward
+                + not_done * self.discount * target_q
             ).detach()
 
             critic_loss = (
@@ -425,10 +417,7 @@ class Diffusion_QL(object):
             self.critic_optimizer.step()
 
             # ------------------------------------------
-            # 🔥 COMPUTE DIFFUSION ENTROPY
-            # Sample 10 actions per state in batch
-            # Measure their diversity (std)
-            # High diversity = agent exploring well
+            # COMPUTE DIFFUSION ENTROPY
             # ------------------------------------------
             state_rpt_ent = torch.repeat_interleave(
                 state, repeats=10, dim=0
@@ -439,22 +428,14 @@ class Diffusion_QL(object):
             sampled_actions = sampled_actions.view(
                 batch_size, 10, self.action_dim
             )
-
-            # Entropy = mean std across action dimensions
-            # Per state: how diverse are the 10 samples?
             entropy = sampled_actions.std(
                 dim=1
             ).mean()
 
             # ------------------------------------------
             # ACTOR UPDATE
-            # 🔥 L = L_bc + eta*L_ql - alpha*entropy
-            #
-            # - alpha*entropy term:
-            #   Maximises action diversity
-            #   Prevents all 10 samples converging
-            #   to same action (policy collapse)
-            #   This is the key novel contribution
+            # L = L_bc + eta*L_ql - alpha*entropy
+            # (q_loss is a normalised ratio → scale-invariant)
             # ------------------------------------------
             bc_loss    = self.actor.loss(action, state)
             new_action = self.actor(state)
@@ -468,7 +449,6 @@ class Diffusion_QL(object):
                 q_loss = -q2_new.mean() / \
                     q1_new.abs().mean().detach()
 
-            # 🔥 Entropy-regularised actor loss
             actor_loss = (
                 bc_loss
                 + self.eta * q_loss
@@ -486,11 +466,7 @@ class Diffusion_QL(object):
             self.actor_optimizer.step()
 
             # ------------------------------------------
-            # 🔥 AUTO-TUNE ALPHA
-            # Like SAC: adjust alpha to maintain
-            # target entropy level
-            # If entropy too low → increase alpha
-            # If entropy too high → decrease alpha
+            # AUTO-TUNE ALPHA
             # ------------------------------------------
             if self.auto_alpha:
                 alpha_loss = -(
@@ -541,17 +517,8 @@ class Diffusion_QL(object):
     # ----------------------------------------------------------
     def sample_action(self, state):
         """
-        🔥 Entropy-guided action selection.
-
-        Scores each candidate action with:
-          score = Q(s,a) + alpha * diversity_bonus
-
-        diversity_bonus = how different this action
-        is from the average of all candidates.
-
-        High diversity = unexplored region = exploration bonus
-        This gives DQL SAC-quality exploration while
-        keeping diffusion's multimodal advantage.
+        Entropy-guided action selection.
+        score = Q(s,a) + alpha * diversity_bonus
         """
         state_t   = torch.FloatTensor(
             state.reshape(1, -1)
@@ -561,17 +528,12 @@ class Diffusion_QL(object):
         )
 
         with torch.no_grad():
-            # Sample 50 candidate actions
             actions = self.actor.sample(state_rpt)
 
-            # Q-value for each candidate
             q_values = self.critic_target.q_min(
                 state_rpt, actions
             ).flatten()
 
-            # 🔥 Diversity bonus
-            # How far is each action from the mean?
-            # Normalised by std for scale invariance
             action_mean = actions.mean(
                 dim=0, keepdim=True
             )
@@ -582,10 +544,8 @@ class Diffusion_QL(object):
                 (actions - action_mean) / action_std
             ).norm(dim=1)
 
-            # Combined score: Q-value + entropy bonus
             score = q_values + self.alpha * diversity
 
-            # Select via softmax over combined score
             probs = F.softmax(
                 score / self.action_temperature, dim=0
             )
@@ -606,7 +566,6 @@ class Diffusion_QL(object):
             self.critic.state_dict(),
             f"{dir}/critic{suffix}.pth"
         )
-        # Save alpha if auto-tuning
         if self.auto_alpha:
             torch.save(
                 self.log_alpha,
@@ -630,7 +589,6 @@ class Diffusion_QL(object):
                 weights_only=True,
             )
         )
-        # Load alpha if auto-tuning
         if self.auto_alpha:
             alpha_path = (
                 f"{dir}/log_alpha{suffix}.pth"

@@ -63,7 +63,7 @@ W = {
     "off_road"            : 35.0,
     "wrong_lane"          : 40.0,
     "wrong_way"           : 30.0,
-    "stuck"               :  0.5,
+    "stuck"               :  5.0,
 
     # Proactive collision avoidance (LiDAR)
     "proximity_penalty"   :  8.0,

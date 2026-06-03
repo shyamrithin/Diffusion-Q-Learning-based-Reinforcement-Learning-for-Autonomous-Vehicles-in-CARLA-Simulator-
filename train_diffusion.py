@@ -1,6 +1,6 @@
 # ==========================================================
 # train_diffusion.py
-# RLCarla Training Script v11 — Entropy-Regularised DQL
+# RLCarla Training Script v14 — Entropy-Regularised DQL
 #
 # Changes from v7:
 #   - auto_alpha=True passed to agent
@@ -60,7 +60,7 @@ torch.set_float32_matmul_precision("medium")
 # ==========================================================
 class TrainConfig:
     """
-    Diffusion-QL v11 — Entropy-Regularised.
+    Diffusion-QL v14 — Entropy-Regularised.
 
     Key additions vs v7:
       ALPHA      = 0.2  (entropy coefficient)
@@ -133,7 +133,7 @@ class TrainConfig:
     ]
 
     CHECKPOINT_DIR = "checkpoints"
-    LOG_DIR        = "runs/rlcarla_v11"
+    LOG_DIR        = "runs/rlcarla_v14"
     DEVICE = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -487,7 +487,7 @@ def draw_hud(screen, font, info, total_steps, episode,
 pygame.init()
 screen = pygame.display.set_mode((cfg.WIDTH, cfg.HEIGHT))
 pygame.display.set_caption(
-    "RLCarla — Entropy-Regularised DQL v11"
+    "RLCarla — Entropy-Regularised DQL v14"
 )
 clock  = pygame.time.Clock()
 font   = pygame.font.SysFont("monospace", 16)
@@ -536,7 +536,7 @@ current_view    = "third_person"
 current_alpha   = cfg.ALPHA
 current_entropy = 0.0
 
-logger.info(f"Algorithm        : DQL v11 (Entropy-Reg)")
+logger.info(f"Algorithm        : DQL v14 (Entropy-Reg)")
 logger.info(f"Device           : {cfg.DEVICE}")
 logger.info(f"Obs dim          : {OBS_DIM}")
 logger.info(f"Start episode    : {start_episode}")
@@ -844,4 +844,4 @@ finally:
     writer.close()
     env.close()
     pygame.quit()
-    logger.info("DQL v11 training finished.")
+    logger.info("DQL v14 training finished.")
