@@ -1,25 +1,26 @@
 # ==========================================================
 # train_diffusion.py
 # RLCarla Training Script v14 — Entropy-Regularised DQL
+#                               + Reward Scaling
+#                               + Replay-Buffer Persistence
 #
-# Changes from v7:
-#   - auto_alpha=True passed to agent
-#     Alpha auto-tunes like SAC during training
-#   - Entropy + alpha logged to TensorBoard
-#     Track exploration quality over time
-#   - metric dict updated for entropy/alpha keys
-#   - All v7 fixes retained:
-#     Critic pre-training (20k steps)
-#     ETA scheduling (0 → 0.001)
-#     Periodic critic target reset (10k steps)
-#     Separate LR (critic 10x actor)
-#     Reward clipping [-10, 10]
+# Changes in this revision:
+#   - Replay buffer is now saved to disk alongside model
+#     checkpoints (every SAVE_EVERY episodes) and reloaded
+#     on resume. A power cut / interruption no longer wipes
+#     the ~200k-transition buffer, so resumes recover the
+#     critic's experience instead of restarting from empty.
+#   - MAX_EPISODES extended to 2000 (V14 was still climbing
+#     at the previous 1500 horizon).
+#   - Fixed the startup log line that mis-printed critic LR
+#     as LR*10; the agent actually uses LR*2.
 #
-# Expected improvement over v7:
-#   Entropy bonus → SAC-quality exploration
-#   Auto-alpha    → balanced exploration/exploitation
-#   Diffusion     → multimodal action distribution
-#   = SAC convergence speed + DQL expressiveness
+# Retained V14 recipe (the configuration that broke through):
+#   reward_scale = 0.1 (in agent TD targets)
+#   reward clip [-15,15] in reward.py, [-10,10] in buffer
+#   critic LR = LR*2, stuck penalty = 5.0
+#   Critic pre-training (40k), ETA schedule (0 -> 0.0005),
+#   periodic critic target reset (7k), entropy auto-alpha.
 #
 # CARLA 0.9.16 | Gymnasium 1.3 | Python 3.10
 # ==========================================================
@@ -60,29 +61,17 @@ torch.set_float32_matmul_precision("medium")
 # ==========================================================
 class TrainConfig:
     """
-    Diffusion-QL v14 — Entropy-Regularised.
-
-    Key additions vs v7:
-      ALPHA      = 0.2  (entropy coefficient)
-      AUTO_ALPHA = True (auto-tune like SAC)
-
-    With entropy regularisation:
-      - DQL explores like SAC (smart exploration)
-      - Diffusion keeps multimodal advantage
-      - Expected convergence similar to SAC
-      - 1300 episodes should be sufficient
+    Diffusion-QL v14 — Entropy-Regularised + Reward Scaling.
 
     All matched to SAC/PPO for fair comparison:
-      MAX_EPISODES = 1300
-      Same curriculum
-      Same traffic light schedule
+      Same curriculum, same traffic light schedule.
     """
 
     WIDTH          = 800
     HEIGHT         = 450
     FPS            = 20
 
-    MAX_EPISODES          = 1500
+    MAX_EPISODES          = 2000
     MAX_STEPS             = 1000
 
     START_RANDOM_STEPS    = 10000
@@ -104,7 +93,7 @@ class TrainConfig:
     GRAD_NORM             = 0.05
     ACTION_TEMPERATURE    = 0.05
 
-    # 🔥 Entropy regularisation
+    # Entropy regularisation
     ALPHA      = 0.2    # initial entropy coefficient
     AUTO_ALPHA = True   # auto-tune like SAC
 
@@ -134,6 +123,8 @@ class TrainConfig:
 
     CHECKPOINT_DIR = "checkpoints"
     LOG_DIR        = "runs/rlcarla_v14"
+    # Replay-buffer persistence file
+    BUFFER_PATH    = "checkpoints/replay_buffer.npz"
     DEVICE = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -189,7 +180,12 @@ def resume_training(agent, checkpoint_dir):
 # REPLAY BUFFER
 # ==========================================================
 class ReplayBuffer:
-    """Replay buffer with reward clipping [-10, 10]."""
+    """Replay buffer with reward clipping [-10, 10].
+
+    Supports disk persistence (save/load) so an
+    interrupted run can resume with experience intact
+    instead of restarting from an empty buffer.
+    """
 
     def __init__(self, state_dim, action_dim, max_size):
         self.max_size   = max_size
@@ -237,6 +233,49 @@ class ReplayBuffer:
             torch.FloatTensor(
                 self.not_done[idx]).to(device),
         )
+
+    def save(self, path):
+        """Persist buffer to disk (only the filled portion).
+
+        Writes to a temp file then renames, so a crash
+        mid-write can't corrupt an existing good buffer.
+        """
+        try:
+            tmp = path + ".tmp"
+            np.savez(
+                tmp,
+                state      = self.state[:self.size],
+                action     = self.action[:self.size],
+                next_state = self.next_state[:self.size],
+                reward     = self.reward[:self.size],
+                not_done   = self.not_done[:self.size],
+                ptr        = np.array(self.ptr),
+                size       = np.array(self.size),
+            )
+            # np.savez appends .npz to the temp name
+            os.replace(tmp + ".npz", path)
+        except Exception as e:
+            logger.warning(f"Buffer save failed: {e}")
+
+    def load(self, path):
+        """Reload buffer from disk. Returns True on success."""
+        if not os.path.exists(path):
+            return False
+        try:
+            data = np.load(path)
+            n = int(data["size"])
+            n = min(n, self.max_size)
+            self.state[:n]      = data["state"][:n]
+            self.action[:n]     = data["action"][:n]
+            self.next_state[:n] = data["next_state"][:n]
+            self.reward[:n]     = data["reward"][:n]
+            self.not_done[:n]   = data["not_done"][:n]
+            self.size = n
+            self.ptr  = int(data["ptr"]) % self.max_size
+            return True
+        except Exception as e:
+            logger.warning(f"Buffer load failed: {e}")
+            return False
 
     def __len__(self):
         return self.size
@@ -515,7 +554,7 @@ agent = Diffusion_QL(
     lr                 = cfg.LR,
     grad_norm          = cfg.GRAD_NORM,
     action_temperature = cfg.ACTION_TEMPERATURE,
-    # 🔥 Entropy regularisation
+    # Entropy regularisation
     alpha              = cfg.ALPHA,
     auto_alpha         = cfg.AUTO_ALPHA,
 )
@@ -530,6 +569,21 @@ start_episode = resume_training(
 replay          = ReplayBuffer(
     OBS_DIM, 3, cfg.BUFFER_SIZE
 )
+
+# Reload the replay buffer if resuming and a saved
+# buffer exists — avoids the empty-buffer recovery dip.
+if start_episode > 0:
+    if replay.load(cfg.BUFFER_PATH):
+        logger.info(
+            f"Replay buffer restored — "
+            f"{len(replay)} transitions"
+        )
+    else:
+        logger.info(
+            "No saved buffer found — "
+            "buffer will refill from scratch"
+        )
+
 best_reward     = -1e9
 total_steps     = start_episode * 200
 current_view    = "third_person"
@@ -542,13 +596,13 @@ logger.info(f"Obs dim          : {OBS_DIM}")
 logger.info(f"Start episode    : {start_episode}")
 logger.info(f"Target end       : {cfg.MAX_EPISODES}")
 logger.info(f"Actor LR         : {cfg.LR}")
-logger.info(f"Critic LR        : {cfg.LR * 10}")
+logger.info(f"Critic LR        : {cfg.LR * 2}")
 logger.info(f"Alpha (init)     : {cfg.ALPHA}")
 logger.info(f"Auto alpha       : {cfg.AUTO_ALPHA}")
 logger.info(f"Target entropy   : {-3.0}")
 logger.info(f"Grad norm        : {cfg.GRAD_NORM}")
 logger.info(f"Train freq       : {cfg.TRAIN_FREQ}")
-logger.info(f"Reward clip      : [-10, 10]")
+logger.info(f"Reward clip      : buffer [-10,10]")
 logger.info(
     f"Critic pre-train : {cfg.PRE_TRAIN_CRITIC_STEPS}"
 )
@@ -821,8 +875,12 @@ try:
             agent.save_model(
                 cfg.CHECKPOINT_DIR, id=episode
             )
+            # Persist the replay buffer alongside the model
+            # so an interruption resumes with experience.
+            replay.save(cfg.BUFFER_PATH)
             logger.info(
-                f"Checkpoint saved — episode {episode}"
+                f"Checkpoint saved — episode {episode} "
+                f"(+ buffer, {len(replay)} transitions)"
             )
 
         if ep_reward > best_reward:
@@ -841,6 +899,15 @@ except Exception:
     traceback.print_exc()
 
 finally:
+    # Save buffer on exit so even a manual stop is recoverable
+    try:
+        replay.save(cfg.BUFFER_PATH)
+        logger.info(
+            f"Buffer saved on exit — "
+            f"{len(replay)} transitions"
+        )
+    except Exception:
+        pass
     writer.close()
     env.close()
     pygame.quit()
