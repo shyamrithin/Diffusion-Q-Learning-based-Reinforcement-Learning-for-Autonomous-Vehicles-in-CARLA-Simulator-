@@ -174,7 +174,7 @@ class PPOActorCritic(nn.Module):
 
         # Log std as learnable parameter (state-independent)
         self.actor_log_std = nn.Parameter(
-            torch.ones(action_dim) * -0.7
+            torch.zeros(action_dim)
         )
 
         # Critic head — outputs V(s)

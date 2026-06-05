@@ -94,7 +94,7 @@ class PPOConfig:
     CLIP_EPSILON   = 0.2
     VF_COEF        = 0.5
     # 🔥 Higher entropy — more exploration
-    ENT_COEF       = 0.05
+    ENT_COEF       = 0.01
     HIDDEN_DIM     = 256
 
     # Curriculum — matched to SAC/DQL
