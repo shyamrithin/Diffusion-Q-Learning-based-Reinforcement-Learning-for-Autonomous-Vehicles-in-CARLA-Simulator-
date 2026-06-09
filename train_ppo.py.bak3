@@ -1,94 +1,102 @@
 # ==========================================================
 # train_ppo.py
-# PPO Baseline Training Script v4
+# PPO Baseline Training Script v3
 #
-# Changes from v3:
-#   - ACTION SMOOTHING added (alpha=0.7), matching DQL/SAC.
-#     The policy samples a raw action; the EXECUTED action is
-#     an EMA blend of raw and the previous executed action:
-#         exec = 0.7*raw + 0.3*prev_exec
-#     This removes the high-frequency steering oscillation
-#     (sawing left/right -> circling) seen with raw PPO output.
-#     IMPORTANT for PPO correctness: the rollout buffer still
-#     stores the RAW sampled action with its matching log_prob
-#     (on-policy consistency). Smoothing is treated as an
-#     actuator dynamic on the environment side, identical in
-#     spirit to how DQL/SAC executed smoothed actions.
-#   - log_std init fixed in agents/ppo.py (std~0.5, not 1.0)
-#   - reward scaling x0.1 (value-scale stability)
-#   - ENT_COEF = 0.01 (standard continuous-control value)
+# Changes from v2:
+#   - Early throttle bias added (< 15k steps)
+#     Prevents stuck during early exploration
+#     Same fix that helped SAC and DQL
+#   - ENT_COEF increased 0.01 → 0.05
+#     More entropy = more exploration
+#     Prevents policy collapsing to "stay still"
+#   - ROLLOUT_SIZE reduced 2048 → 1024
+#     More frequent updates
+#     Less stuck experience accumulated per update
+#   - total_steps offset on resume
+#   - Curriculum matched to SAC/DQL
 #
 # CARLA 0.9.16 | Gymnasium 1.3 | Python 3.10
 # ==========================================================
+
 import os
 import time
 import traceback
 import logging
 import math
 import re
+
 import gymnasium as gym
 import rlcarla
 import numpy as np
 import torch
 import pygame
+
 from torch.utils.tensorboard import SummaryWriter
 from agents.ppo               import PPO
 from rlcarla.core.obs_builder import OBS_DIM
 from rlcarla.utils.trajectory import (
     draw_trajectory, get_future_waypoints
 )
+
 logging.basicConfig(
     level   = logging.INFO,
     format  = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt = "%H:%M:%S",
 )
 logger = logging.getLogger("train_ppo")
+
 torch.set_float32_matmul_precision("medium")
+
+
 # ==========================================================
 # CONFIG
 # ==========================================================
 class PPOConfig:
     """
-    PPO training configuration v4.
+    PPO training configuration v3.
 
     Key fixes:
-      ACTION_ALPHA = 0.7
-        EMA action smoothing on executed action, matching
-        DQL/SAC. Removes steering oscillation / circling.
-      ENT_COEF = 0.01
-        Standard continuous-control entropy.
-      log_std init -0.7 (in agents/ppo.py)
-        std ~ 0.5 so the learned mean controls the action
-        instead of being drowned in sampling noise.
-      reward x0.1
-        Value-scale stability (matches DQL-E).
+      ROLLOUT_SIZE : 2048 → 1024
+        More frequent policy updates
+        Less stuck experience per update
+
+      ENT_COEF : 0.01 → 0.05
+        More exploration
+        Prevents policy collapse to stationary
+
+      Throttle bias < 15k steps:
+        Forces minimum throttle early
+        Prevents aggressive braking exploration
 
     Matched to SAC/DQL for fair comparison:
       MAX_EPISODES = 1300
       Same curriculum thresholds
       Same traffic light schedule
-      Same action smoothing (alpha=0.7)
     """
+
     WIDTH          = 800
     HEIGHT         = 450
     FPS            = 20
+
     MAX_EPISODES   = 1300
     MAX_STEPS      = 1000
-    # Reduced rollout — more frequent updates
+
+    # 🔥 Reduced rollout — more frequent updates
     ROLLOUT_SIZE   = 1024
     BATCH_SIZE     = 256
     PPO_EPOCHS     = 10
     SAVE_EVERY     = 10
+
     DISCOUNT       = 0.99
     GAE_LAMBDA     = 0.95
     LR             = 3e-4
     GRAD_NORM      = 0.5
     CLIP_EPSILON   = 0.2
     VF_COEF        = 0.5
+    # 🔥 Higher entropy — more exploration
     ENT_COEF       = 0.01
     HIDDEN_DIM     = 256
-    # Action smoothing — matches DQL/SAC executed actions
-    ACTION_ALPHA   = 0.7
+
     # Curriculum — matched to SAC/DQL
     CURRICULUM = [
         (0,   "empty"),
@@ -96,16 +104,22 @@ class PPOConfig:
         (500, "medium"),
         (800, "heavy"),
     ]
+
     TRAFFIC_LIGHT_CURRICULUM = [
         (0,   "off"),
         (700, "on"),
     ]
+
     CHECKPOINT_DIR = "checkpoints_ppo"
     LOG_DIR        = "runs/rlcarla_ppo"
     DEVICE = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
+
+
 cfg = PPOConfig()
+
+
 # ==========================================================
 # HELPERS
 # ==========================================================
@@ -116,6 +130,8 @@ def get_traffic_preset(episode):
         if episode >= ep_thresh:
             preset = p
     return preset
+
+
 def get_traffic_lights(episode):
     """Return traffic light mode for current episode."""
     mode = "off"
@@ -123,6 +139,8 @@ def get_traffic_lights(episode):
         if episode >= ep_thresh:
             mode = m
     return mode
+
+
 def find_latest_checkpoint(checkpoint_dir):
     """Find latest PPO checkpoint (excluding 9999)."""
     if not os.path.exists(checkpoint_dir):
@@ -142,6 +160,8 @@ def find_latest_checkpoint(checkpoint_dir):
     if not episodes:
         return 0, None
     return max(episodes), checkpoint_dir
+
+
 # ==========================================================
 # LIDAR VISUALIZER — Red theme for PPO
 # ==========================================================
@@ -149,9 +169,11 @@ def draw_point_cloud(screen, points, center_x, center_y,
                      size=180, max_range=30.0):
     """Square LiDAR panel — red PPO theme."""
     font_s = pygame.font.SysFont("monospace", 10)
+
     bg = pygame.Surface((size, size), pygame.SRCALPHA)
     bg.fill((0, 0, 0, 175))
     screen.blit(bg, (center_x-size//2, center_y-size//2))
+
     pygame.draw.rect(
         screen, (130, 0, 0),
         (center_x-size//2, center_y-size//2, size, size), 1
@@ -177,15 +199,18 @@ def draw_point_cloud(screen, points, center_x, center_y,
             (center_x+offset, center_y-size//2),
             (center_x+offset, center_y+size//2), 1
         )
+
     pygame.draw.polygon(screen, (255, 80, 80), [
         (center_x,   center_y-size//2-7),
         (center_x-4, center_y-size//2+1),
         (center_x+4, center_y-size//2+1),
     ])
+
     lbl_30 = font_s.render("30m", True, (160, 60, 60))
     lbl_15 = font_s.render("15m", True, (120, 40, 40))
     screen.blit(lbl_30, (center_x+3, center_y-size//2+2))
     screen.blit(lbl_15, (center_x+3, center_y-size//4+2))
+
     if len(points) > 0:
         scale = (size//2) / max_range
         x_pts = points[:,0]
@@ -196,6 +221,7 @@ def draw_point_cloud(screen, points, center_x, center_y,
         x_pts = x_pts[mask]
         y_pts = y_pts[mask]
         z_pts = z_pts[mask]
+
         for i in range(len(x_pts)):
             rx = int(center_x - y_pts[i] * scale)
             ry = int(center_y - x_pts[i] * scale)
@@ -213,12 +239,14 @@ def draw_point_cloud(screen, points, center_x, center_y,
             pygame.draw.circle(
                 screen, color, (rx, ry), 2
             )
+
     pygame.draw.circle(
         screen, (255, 80, 80), (center_x, center_y), 5
     )
     pygame.draw.circle(
         screen, (255, 255, 255), (center_x, center_y), 2
     )
+
     title = font_s.render(
         "LiDAR [PPO]", True, (200, 0, 0)
     )
@@ -226,6 +254,7 @@ def draw_point_cloud(screen, points, center_x, center_y,
         center_x - title.get_width()//2,
         center_y + size//2 + 4
     ))
+
     legend = [
         ((50,  50,  50),  "gnd"),
         ((100, 100, 100), "low"),
@@ -242,6 +271,8 @@ def draw_point_cloud(screen, points, center_x, center_y,
         lbl = font_s.render(label, True, color)
         screen.blit(lbl, (lx+10, ly))
         ly += 14
+
+
 # ==========================================================
 # HUD — Red theme for PPO
 # ==========================================================
@@ -262,29 +293,37 @@ def draw_hud(screen, font, info, total_steps, episode,
         f"Map         : "
         f"{str(info.get('map','?')).split('/')[-1]}",
     ]
+
     surf = pygame.Surface(
         (260, len(lines)*22+10), pygame.SRCALPHA
     )
     surf.fill((30, 0, 0, 140))
     screen.blit(surf, (5, 5))
+
     for i, line in enumerate(lines):
         txt = font.render(line, True, (255, 200, 200))
         screen.blit(txt, (10, 10+i*22))
+
+
 # ==========================================================
 # PYGAME INIT
 # ==========================================================
 pygame.init()
 screen = pygame.display.set_mode((cfg.WIDTH, cfg.HEIGHT))
-pygame.display.set_caption("RLCarla — PPO Baseline v4")
+pygame.display.set_caption("RLCarla — PPO Baseline v3")
 clock  = pygame.time.Clock()
 font   = pygame.font.SysFont("monospace", 16)
+
 # ==========================================================
 # ENV + AGENT
 # ==========================================================
 os.makedirs(cfg.CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(cfg.LOG_DIR,        exist_ok=True)
+
 writer = SummaryWriter(log_dir=cfg.LOG_DIR)
+
 env = gym.make("RLCarla-v0")
+
 agent = PPO(
     state_dim    = OBS_DIM,
     action_dim   = 3,
@@ -302,6 +341,7 @@ agent = PPO(
     rollout_size = cfg.ROLLOUT_SIZE,
     batch_size   = cfg.BATCH_SIZE,
 )
+
 # ==========================================================
 # RESUME
 # ==========================================================
@@ -315,10 +355,12 @@ if latest_ep > 0:
     logger.info(f"Resumed PPO from episode {latest_ep}")
 else:
     logger.info("PPO starting fresh")
+
 best_reward  = -1e9
 total_steps  = start_episode * 200
 current_view = "third_person"
-logger.info(f"Algorithm     : PPO v4 (baseline)")
+
+logger.info(f"Algorithm     : PPO v3 (baseline)")
 logger.info(f"Device        : {cfg.DEVICE}")
 logger.info(f"Obs dim       : {OBS_DIM}")
 logger.info(f"Start episode : {start_episode}")
@@ -328,34 +370,43 @@ logger.info(f"Rollout size  : {cfg.ROLLOUT_SIZE}")
 logger.info(f"PPO epochs    : {cfg.PPO_EPOCHS}")
 logger.info(f"Ent coef      : {cfg.ENT_COEF}")
 logger.info(f"Clip epsilon  : {cfg.CLIP_EPSILON}")
-logger.info(f"Action smooth : alpha={cfg.ACTION_ALPHA}")
 logger.info(f"Throttle bias : < 15k steps")
 logger.info(f"Lights ON     : episode 700")
 logger.info(f"Heavy traffic : episode 800")
+
 # ==========================================================
 # TRAINING LOOP
 # ==========================================================
 running = True
+
 try:
     for episode in range(start_episode, cfg.MAX_EPISODES):
+
         if not running:
             break
+
         traffic_preset = get_traffic_preset(episode)
         tl_mode        = get_traffic_lights(episode)
+
         env.unwrapped._traffic_preset    = traffic_preset
         env.unwrapped.cfg.TRAFFIC_LIGHTS = tl_mode
-        prev_exec_action = np.zeros(3, dtype=np.float32)
+
         state, _ = env.reset()
+
         ep_reward   = 0.0
         ep_info     = {}
         ppo_metrics = None
+
         for step in range(cfg.MAX_STEPS):
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+
             keys = pygame.key.get_pressed()
             if keys[pygame.K_ESCAPE]:
                 running = False
+
             if keys[pygame.K_1]:
                 current_view = "third_person"
                 env.unwrapped.set_camera_view(
@@ -376,53 +427,51 @@ try:
                 env.unwrapped.set_camera_view(
                     current_view
                 )
+
             if keys[pygame.K_5]:
                 env.unwrapped.set_spectator_mode("follow")
             elif keys[pygame.K_6]:
                 env.unwrapped.set_spectator_mode("top")
             elif keys[pygame.K_7]:
                 env.unwrapped.set_spectator_mode("none")
+
             if not running:
                 break
-            # PPO: get RAW action + value + log_prob.
-            # PPO trains on the raw action (its log_prob
-            # matches), keeping the on-policy update valid.
-            raw_action, value, log_prob = \
+
+            # PPO: get action + value + log_prob
+            action, value, log_prob = \
                 agent.sample_action(state)
-            # EXECUTED action = EMA smoothing of raw output,
-            # matching DQL/SAC actuator behaviour. This is
-            # what the vehicle actually receives, preventing
-            # high-frequency steering oscillation (circling).
-            exec_action = (
-                cfg.ACTION_ALPHA * raw_action +
-                (1.0 - cfg.ACTION_ALPHA) * prev_exec_action
-            ).astype(np.float32)
-            # Early throttle bias on the executed action
-            # (prevents stuck during early exploration).
+
+            # 🔥 Early throttle bias
+            # Prevents stuck during early exploration
+            # PPO entropy explores brake aggressively
             if total_steps < 15000:
-                exec_action[0] = max(exec_action[0], 0.4)
-                exec_action[2] = min(exec_action[2], 0.1)
+                action[0] = max(action[0], 0.4)
+                action[2] = min(action[2], 0.1)
+
             next_state, reward, done, trunc, info = \
-                env.step(exec_action)
-            # Clip + scale reward for value-scale stability
+                env.step(action)
+
+            # Clip reward for stability
             clipped_reward = float(
                 np.clip(reward, -10.0, 10.0)
             ) * 0.1
-            # Collect into rollout buffer — store the RAW
-            # sampled action with its matching log_prob so the
-            # PPO importance ratio stays correct.
+
+            # Collect into rollout buffer
             agent.collect(
-                state, raw_action, clipped_reward,
+                state, action, clipped_reward,
                 value, log_prob, float(done or trunc)
             )
+
             # PPO update when rollout full
             if agent.ready_to_update():
                 ppo_metrics = agent.update(next_state)
-            state            = next_state
-            prev_exec_action = exec_action
-            ep_reward       += reward
-            total_steps     += 1
-            ep_info          = info
+
+            state       = next_state
+            ep_reward  += reward
+            total_steps += 1
+            ep_info     = info
+
             # Render
             frame = env.unwrapped.get_camera_frame()
             if frame is not None:
@@ -446,12 +495,14 @@ try:
                     frame.swapaxes(0, 1)
                 )
                 screen.blit(surf, (0, 0))
+
             draw_hud(
                 screen, font, ep_info,
                 total_steps, episode, ep_reward,
                 agent._step, traffic_preset,
                 tl_mode, current_view, start_episode,
             )
+
             if env.unwrapped._lidar is not None:
                 points = (
                     env.unwrapped._lidar.get_points()
@@ -463,10 +514,13 @@ try:
                     size      = 180,
                     max_range = 30.0,
                 )
+
             pygame.display.flip()
             clock.tick(cfg.FPS)
+
             if done or trunc:
                 break
+
         # Episode logging
         writer.add_scalar(
             "reward/episode",     ep_reward, episode)
@@ -474,6 +528,7 @@ try:
             "reward/total_steps", ep_reward, total_steps)
         writer.add_scalar(
             "env/episode_length", step+1,    episode)
+
         if ppo_metrics:
             writer.add_scalar(
                 "loss/actor",
@@ -490,6 +545,7 @@ try:
                 np.mean(ppo_metrics["entropy"]),
                 episode
             )
+
         for key in [
             "forward_progress", "lane_center",
             "yaw_align", "curve_reward", "collision",
@@ -502,6 +558,7 @@ try:
                     f"reward/{key}",
                     ep_info[key], episode
                 )
+
         logger.info(
             f"Ep {episode:04d} "
             f"(+{episode-start_episode:04d}) | "
@@ -512,6 +569,7 @@ try:
             f"Buffer {agent._step:4d} | "
             f"Done: {ep_info.get('term_reason','trunc')}"
         )
+
         if episode % cfg.SAVE_EVERY == 0:
             agent.save_model(
                 cfg.CHECKPOINT_DIR, id=episode
@@ -519,6 +577,7 @@ try:
             logger.info(
                 f"[PPO] Checkpoint — episode {episode}"
             )
+
         if ep_reward > best_reward:
             best_reward = ep_reward
             agent.save_model(
@@ -528,12 +587,15 @@ try:
                 f"[PPO] New best — "
                 f"reward {best_reward:.2f}"
             )
+
 except KeyboardInterrupt:
     logger.info("Stopped by user.")
+
 except Exception:
     traceback.print_exc()
+
 finally:
     writer.close()
     env.close()
     pygame.quit()
-    logger.info("PPO v4 training finished.")
+    logger.info("PPO v3 training finished.")
