@@ -22,20 +22,58 @@
 #   evaluation reference, not a navigation target. Report it
 #   that way.
 #
+# --- REVISION (routes locked + planner import fixed) -------
+#   1) ROUTES filled with the three locked, visually-verified
+#      evaluation routes (Town03):
+#        R1 roundabout : spawn 123 -> dest 41
+#                        (S->N sweep through central roundabout
+#                         — multimodal yield/merge junction)
+#        R2 curve      : spawn 107 -> dest 170
+#                        (long smooth corner arc, maxStep ~3 deg
+#                         — turning ability / trajectory smooth.)
+#        R3 straight   : spawn 249 -> dest 21
+#                        (dead-straight arterial — lane-keeping)
+#
+#   2) GlobalRoutePlanner import FIXED. The previous version
+#      did `from agents.navigation...` after adding CARLA's
+#      path to sys.path — but this repo has its OWN local
+#      `agents/` package (agents/ql_diffusion.py, ...), which
+#      SHADOWS CARLA's `agents` package when running from the
+#      repo dir. The import therefore failed and the old
+#      try/except SILENTLY set _GRP_AVAILABLE=False, so
+#      generate_reference_route() never produced a path
+#      (trajectory_error / route_completion would be empty).
+#      We now load CARLA's planner by pointing the package
+#      __path__ at CARLA's real directories, so the local
+#      `agents/` cannot shadow it and the whole import chain
+#      (global_route_planner -> local_planner -> controller
+#      -> ...) resolves to CARLA's files.
+#
 # CARLA 0.9.16 | Python 3.10
 # ==========================================================
 
 import os
 import sys
 import math
+import types
 import numpy as np
 
+
 # ----------------------------------------------------------
-# Make CARLA's GlobalRoutePlanner importable.
-# Found on this machine at:
-#   /home/shyam/Carla/PythonAPI/carla/agents/navigation/
-# We add the PythonAPI/carla dir to sys.path so that
-# `from agents.navigation...` resolves.
+# Robust CARLA GlobalRoutePlanner import.
+#
+# PROBLEM: this repo has a LOCAL `agents/` package. Run from
+# the repo dir, `import agents` resolves to the local one
+# (which has no `navigation` submodule), so the normal
+# `from agents.navigation...` import fails — and a try/except
+# wrapper hides it. Adding CARLA's path does NOT help because
+# the name `agents` is already taken by the local package.
+#
+# FIX: override the `agents` and `agents.navigation` package
+# entries in sys.modules with module objects whose __path__
+# points at CARLA's REAL directories. The normal import
+# machinery then resolves every (possibly chained) submodule
+# of the planner to CARLA's files by path.
 # ----------------------------------------------------------
 _CARLA_AGENTS_PATHS = [
     "/home/shyam/Carla/PythonAPI/carla",
@@ -43,16 +81,42 @@ _CARLA_AGENTS_PATHS = [
     os.path.expanduser("~/Carla/PythonAPI/carla"),
     os.path.expanduser("~/carla/PythonAPI/carla"),
 ]
-for _p in _CARLA_AGENTS_PATHS:
-    if os.path.isdir(os.path.join(_p, "agents", "navigation")):
-        if _p not in sys.path:
-            sys.path.append(_p)
-        break
+
+
+def _load_global_route_planner():
+    nav = None
+    for _p in _CARLA_AGENTS_PATHS:
+        cand = os.path.join(_p, "agents", "navigation")
+        if os.path.isdir(cand):
+            nav = cand
+            break
+    if nav is None:
+        raise ImportError(
+            "Could not locate CARLA agents/navigation dir. "
+            "Edit _CARLA_AGENTS_PATHS in route_utils.py."
+        )
+
+    agents_root = os.path.dirname(nav)  # .../agents
+
+    # Override the package names so chained absolute imports
+    # inside the planner resolve to CARLA's files by path,
+    # regardless of the repo's local `agents/` shadowing.
+    pkg_agents = types.ModuleType("agents")
+    pkg_agents.__path__ = [agents_root]
+    sys.modules["agents"] = pkg_agents
+
+    pkg_nav = types.ModuleType("agents.navigation")
+    pkg_nav.__path__ = [nav]
+    sys.modules["agents.navigation"] = pkg_nav
+
+    from agents.navigation.global_route_planner import (
+        GlobalRoutePlanner as _GRP,
+    )
+    return _GRP
+
 
 try:
-    from agents.navigation.global_route_planner import (
-        GlobalRoutePlanner,
-    )
+    GlobalRoutePlanner = _load_global_route_planner()
     _GRP_AVAILABLE = True
 except Exception as _e:  # pragma: no cover
     _GRP_AVAILABLE = False
@@ -65,16 +129,20 @@ except Exception as _e:  # pragma: no cover
 # (spawn_index, destination_index) into
 # world.get_map().get_spawn_points().
 #
-# >>> FILL THESE IN once CARLA is running. Use
-#     visualize_spawn_points() below to pick indices that
-#     start near / pass through a roundabout and an
-#     intersection on Town03. <<<
+# LOCKED routes (Town03) — visually verified in the CARLA
+# window via draw_routes.py. Keep the SAME three routes for
+# ALL agents (DQL-E, SAC, PPO).
 #
-# Keep the SAME three routes for ALL agents.
+#   R1 roundabout : 123 -> 41   sweeps through central
+#                               roundabout (multimodal merge)
+#   R2 curve      : 107 -> 170  long smooth corner arc
+#                               (turning / smoothness)
+#   R3 straight   : 249 -> 21   dead-straight arterial
+#                               (lane-keeping)
 ROUTES = {
-    "route_1_roundabout":   {"spawn": None, "dest": None},
-    "route_2_intersection": {"spawn": None, "dest": None},
-    "route_3_straight":     {"spawn": None, "dest": None},
+    "route_1_roundabout": {"spawn": 123, "dest": 41},
+    "route_2_curve":      {"spawn": 107, "dest": 170},
+    "route_3_straight":   {"spawn": 249, "dest": 21},
 }
 
 # Sampling resolution (metres) for the reference path.
@@ -118,6 +186,30 @@ def generate_reference_route(world, carla_map,
         dtype=np.float32,
     )
     return ref_xy, start_tf
+
+
+def generate_route_by_name(world, carla_map, route_name,
+                           sample_res=ROUTE_SAMPLE_RES):
+    """Convenience wrapper: generate a reference route by its
+    ROUTES key (e.g. 'route_1_roundabout').
+
+    Returns (ref_xy, start_transform) — same as
+    generate_reference_route.
+    """
+    if route_name not in ROUTES:
+        raise KeyError(
+            f"Unknown route '{route_name}'. "
+            f"Available: {list(ROUTES.keys())}"
+        )
+    spec = ROUTES[route_name]
+    if spec["spawn"] is None or spec["dest"] is None:
+        raise ValueError(
+            f"Route '{route_name}' has unfilled indices."
+        )
+    return generate_reference_route(
+        world, carla_map,
+        spec["spawn"], spec["dest"], sample_res,
+    )
 
 
 # ==========================================================
@@ -252,6 +344,35 @@ def visualize_spawn_points(host="localhost", port=2000,
           "near a roundabout and an intersection, then fill "
           "ROUTES in route_utils.py.")
     return sps
+
+
+def verify_routes(host="localhost", port=2000):
+    """Sanity check: confirm the planner is importable and
+    that each locked route traces a non-empty reference path.
+    Run with CARLA up:  python3 -c \
+        'import route_utils; route_utils.verify_routes()'
+    """
+    if not _GRP_AVAILABLE:
+        print("GlobalRoutePlanner NOT available — import "
+              f"failed: {_GRP_IMPORT_ERROR}")
+        return
+    import carla
+    client = carla.Client(host, port)
+    client.set_timeout(10.0)
+    world = client.get_world()
+    cmap = world.get_map()
+    print(f"Planner OK. Map: {cmap.name}")
+    for name, spec in ROUTES.items():
+        try:
+            ref_xy, start_tf = generate_reference_route(
+                world, cmap, spec["spawn"], spec["dest"]
+            )
+            arc = _cumulative_arc_length(ref_xy)
+            print(f"  {name:20s} {spec['spawn']:>3}->"
+                  f"{spec['dest']:>3} | {len(ref_xy):4d} wp "
+                  f"| {arc[-1]:7.1f} m")
+        except Exception as e:
+            print(f"  {name:20s} FAILED: {e}")
 
 
 if __name__ == "__main__":

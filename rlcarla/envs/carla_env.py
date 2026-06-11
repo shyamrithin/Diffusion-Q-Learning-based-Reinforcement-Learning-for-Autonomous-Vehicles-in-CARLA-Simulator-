@@ -1,13 +1,38 @@
 # ==========================================================
 # rlcarla/envs/carla_env.py
-# RLCarla Main Environment v4
+# RLCarla Main Environment v5
 #
-# Changes in this version:
+# Changes in this version (v5 — EVAL FIXED-SPAWN SUPPORT):
+#   - reset()/_spawn_vehicle() now honor an optional fixed
+#     spawn transform for evaluation. When set, the ego
+#     vehicle spawns at exactly that transform and the
+#     curve-biased random spawn is bypassed entirely. This
+#     is what makes fixed-route evaluation reproducible:
+#     all three agents (DQL-E, SAC, PPO) start at the SAME
+#     point on the SAME route. Set via either:
+#         env.unwrapped.set_eval_spawn(transform)   # API
+#         env.unwrapped._eval_spawn_transform = tf  # direct
+#         env.reset(options={"eval_spawn_transform": tf})
+#     Set back to None to restore curve-biased random
+#     spawning for training.
+#   - NOTE on fairness: traffic NPC placement is still not
+#     seeded here, so per-episode traffic differs between
+#     agents. Run N episodes per route/density and report
+#     mean +/- std; do not treat a single episode as
+#     cross-agent comparable.
+#   - NOTE on eval semantics: termination flags
+#     (collision/offroad/wrong-lane/wrong-way/stuck) are
+#     left ON for eval so that "route completion %" means
+#     "fraction of the reference route covered before a
+#     terminating failure" and "collision rate" is the
+#     fraction of episodes ending in collision — both
+#     matching the training regime. Do not disable these
+#     for eval unless you intend to measure a different
+#     thing and say so in the paper.
+#
+# Prior changes (v4):
 #   - Hard 40 km/h speed cap in step()
-#     Physics-level enforcement — cannot exceed 40 km/h
-#     regardless of policy output
 #   - Intersection false-positive offroad fix
-#     CARLA returns None at junctions on valid road
 #   - Curve-biased spawning (60% near curves)
 #   - Same-lane waypoint following enforced
 #   - Wrong-lane strict limit (3 steps)
@@ -115,6 +140,8 @@ class CarlaEnv(gym.Env):
     Speed cap   : 40 km/h hard limit enforced in step()
     Lane policy : Same lane_id waypoints only
     Spawn bias  : 60% near curves for curve training
+                  (bypassed when an eval spawn transform
+                   is set — see set_eval_spawn())
     """
 
     metadata = {"render_modes": ["human"]}
@@ -159,6 +186,13 @@ class CarlaEnv(gym.Env):
         self._episode          = 0
         self._prev_action      = np.zeros(3, dtype=np.float32)
         self._collision_sensor = None
+
+        # --- EVAL fixed-spawn support (v5) -----------------
+        # When not None, _spawn_vehicle() spawns the ego at
+        # exactly this carla.Transform and skips curve-biased
+        # random selection. Used for reproducible fixed-route
+        # evaluation across all three agents.
+        self._eval_spawn_transform = None
 
         self._connect()
 
@@ -354,7 +388,12 @@ class CarlaEnv(gym.Env):
     def _spawn_vehicle(self):
         """
         Spawn blue Tesla Model 3.
-        60% chance to spawn near a curve.
+
+        EVAL MODE  : if self._eval_spawn_transform is set,
+                     spawn at exactly that transform (curve
+                     bias bypassed) so all agents start at
+                     the same fixed route origin.
+        TRAIN MODE : 60% chance to spawn near a curve.
         """
         bp_lib = self.world.get_blueprint_library()
         bp     = random.choice(
@@ -363,6 +402,38 @@ class CarlaEnv(gym.Env):
         if bp.has_attribute("color"):
             bp.set_attribute("color", "0,120,255")
 
+        # --- EVAL: fixed spawn transform -------------------
+        if self._eval_spawn_transform is not None:
+            sp = self._eval_spawn_transform
+            # Lift slightly + retry to avoid ground/road
+            # collision rejection at the exact transform.
+            for dz in (0.3, 0.6, 1.0, 1.5):
+                spawn_tf = carla.Transform(
+                    carla.Location(
+                        x=sp.location.x,
+                        y=sp.location.y,
+                        z=sp.location.z + dz,
+                    ),
+                    sp.rotation,
+                )
+                v = self.world.try_spawn_actor(bp, spawn_tf)
+                if v is not None:
+                    self.vehicle = v
+                    self.actor_list.append(v)
+                    logger.info(
+                        "[Env] EVAL spawn at fixed transform "
+                        f"({sp.location.x:.1f}, "
+                        f"{sp.location.y:.1f})"
+                    )
+                    return True
+            logger.error(
+                "[Env] EVAL fixed spawn failed at "
+                f"({sp.location.x:.1f}, {sp.location.y:.1f}) "
+                "— is the point on a drivable lane?"
+            )
+            return False
+
+        # --- TRAIN: curve-biased random spawn --------------
         curved_points, all_points = self._get_curve_spawn_points()
 
         if (curved_points and
@@ -430,6 +501,20 @@ class CarlaEnv(gym.Env):
         )
 
     # ==========================================================
+    # EVAL API
+    # ==========================================================
+    def set_eval_spawn(self, transform):
+        """
+        Set (or clear) the fixed eval spawn transform.
+
+        Pass a carla.Transform to force the ego to spawn
+        there on the next reset() (curve bias bypassed).
+        Pass None to restore curve-biased random training
+        spawns.
+        """
+        self._eval_spawn_transform = transform
+
+    # ==========================================================
     # RESET
     # ==========================================================
     def reset(self, seed=None, options=None, map_name=None):
@@ -437,9 +522,20 @@ class CarlaEnv(gym.Env):
         Full episode reset.
         Order: cleanup → map → spawn → sensors →
                lights → traffic → kickstart → flush → obs
+
+        Eval: if options contains 'eval_spawn_transform'
+        (a carla.Transform), it overrides the stored
+        _eval_spawn_transform for this episode.
         """
         super().reset(seed=seed)
-        map_name = (options or {}).get("map_name", map_name)
+        opts     = options or {}
+        map_name = opts.get("map_name", map_name)
+
+        # Per-reset eval spawn override (optional)
+        if "eval_spawn_transform" in opts:
+            self._eval_spawn_transform = (
+                opts["eval_spawn_transform"]
+            )
 
         self._episode += 1
         logger.info(
@@ -517,7 +613,7 @@ class CarlaEnv(gym.Env):
         steer    = float(np.clip(action[1], -1.0, 1.0))
         brake    = float(np.clip(action[2],  0.0, 1.0))
 
-        # 🔥 Hard 40 km/h speed cap
+        # Hard 40 km/h speed cap
         current_speed = self._get_speed()
         if current_speed > SPEED_CAP_MS:
             throttle = 0.0
@@ -594,7 +690,7 @@ class CarlaEnv(gym.Env):
             lane_type       = carla.LaneType.Driving
         )
 
-        # 🔥 Junction false-positive fix
+        # Junction false-positive fix
         # CARLA returns None inside junctions even on valid road
         if wp_raw is None and wp_road is not None:
             if wp_road.is_junction:
