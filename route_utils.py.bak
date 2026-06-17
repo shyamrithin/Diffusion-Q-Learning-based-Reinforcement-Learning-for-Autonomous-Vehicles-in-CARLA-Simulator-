@@ -141,7 +141,7 @@ except Exception as _e:  # pragma: no cover
 #                               (lane-keeping)
 ROUTES = {
     "route_1_roundabout": {"spawn": 123, "dest": 41},
-    "route_2_curve":      {"spawn": 170, "dest": 45},
+    "route_2_curve":      {"spawn": 107, "dest": 170},
     "route_3_straight":   {"spawn": 249, "dest": 21},
 }
 

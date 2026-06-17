@@ -25,8 +25,21 @@
 #   python3 record_eval.py --agent ppo  --traffic medium \
 #       --route all --episodes 10
 #
-# NOTE: Fill ROUTES indices in route_utils.py first
-#       (run `python3 route_utils.py` with CARLA up).
+# --- REVISION (per-step collision/offroad logging fix) -----
+#   carla_env.step() does NOT place collision/offroad into the
+#   info dict, and it RESETS self._collision_flag to False at
+#   the end of every step(). The previous version read
+#   info["collision_flag"]/["offroad_flag"] (which never
+#   exist), so every per-step collision/offroad column was 0
+#   and the Section D collision HEATMAP would be EMPTY.
+#   We now derive the terminating collision/offroad from
+#   info["term_reason"] (set when the episode ends) plus the
+#   live env offroad flag, captured BEFORE the next step
+#   clears it. The collision coordinate is the agent's last
+#   logged (x,y) at termination — the standard heatmap proxy.
+#
+# NOTE: ROUTES indices are locked in route_utils.py
+#       (R1 123->41, R2 107->170, R3 249->21).
 #
 # CARLA 0.9.16 | Python 3.10
 # ==========================================================
@@ -121,11 +134,41 @@ def load_agent():
     """
     if args.agent == "dqle":
         from agents.ql_diffusion import Diffusion_QL
+        # Match the FULL constructor signature used in
+        # train_diffusion.py. Training-only hyperparameters
+        # (lr, tau, discount, eta, grad_norm) do not affect
+        # inference, but the constructor requires them, so we
+        # pass the same values the model was trained with.
         agent = Diffusion_QL(
-            state_dim=OBS_DIM, action_dim=3,
-            max_action=1.0, device=DEVICE,
+            state_dim          = OBS_DIM,
+            action_dim         = 3,
+            max_action         = 1.0,
+            device             = DEVICE,
+            discount           = 0.99,
+            tau                = 0.005,
+            eta                = 0.001,
+            beta_schedule      = "vp",
+            n_timesteps        = 3,
+            lr                 = 3e-5,
+            grad_norm          = 0.05,
+            action_temperature = 0.05,
+            alpha              = 0.2,
+            auto_alpha         = True,
         )
         agent.load_model(CKPT_DIR, id=int(args.ckpt_id))
+        # CRITICAL FIX: load_model() restores self.critic but
+        # NOT self.critic_target (it stays at random-init from
+        # the constructor's deepcopy). sample_action() scores
+        # its 50 candidate actions with critic_target.q_min(),
+        # so without this sync the policy selects actions using
+        # a RANDOM critic -> erratic low-throttle commands ->
+        # car idles and trips the stuck detector. During
+        # training this never showed because critic_target is
+        # soft-updated every step; at eval there are no updates.
+        # Syncing target<-critic reproduces the end-of-training
+        # state (target ~= critic).
+        import copy as _copy
+        agent.critic_target = _copy.deepcopy(agent.critic)
         try:
             agent.actor.eval()
         except Exception:
@@ -145,21 +188,24 @@ def load_agent():
 
     if args.agent == "sac":
         from agents.sac import SAC
+        # SAC.__init__ takes (state_dim, action_dim, ...) with
+        # defaults for the rest; pass device explicitly.
         agent = SAC(
             state_dim=OBS_DIM, action_dim=3,
             max_action=1.0, device=DEVICE,
         )
         agent.load_model(CKPT_DIR, id=int(args.ckpt_id))
+        # SAC.load_model already syncs critic_target, and SAC
+        # selects actions from the actor only (never the
+        # critic), so there is NO idle bug here.
         agent.actor.eval()
 
         def act_fn(state, prev, alpha=0.7):
-            with torch.no_grad():
-                st = torch.FloatTensor(
-                    state.reshape(1, -1)
-                ).to(DEVICE)
-                action, _ = agent.actor.sample(st)
-            raw = action.cpu().numpy().flatten().astype(
-                np.float32
+            # DETERMINISTIC eval: use the policy MEAN via
+            # get_action(), NOT actor.sample() (which adds
+            # Gaussian exploration noise meant for training).
+            raw = np.asarray(
+                agent.get_action(state), dtype=np.float32
             )
             sm = (alpha * raw + (1 - alpha) * prev)
             return _to_env_action(sm)
@@ -171,20 +217,22 @@ def load_agent():
 
     if args.agent == "ppo":
         from agents.ppo import PPO
+        # PPO.__init__ takes (state_dim, action_dim, ...) with
+        # defaults for the rest; pass device explicitly.
         agent = PPO(
             state_dim=OBS_DIM, action_dim=3,
             max_action=1.0, device=DEVICE,
         )
         agent.load_model(CKPT_DIR, id=int(args.ckpt_id))
         try:
-            agent.policy.eval()
+            agent.policy.eval()   # PPO net is self.policy
         except Exception:
             pass
 
         def act_fn(state, prev, alpha=1.0):
-            # PPO outputs continuous policy directly; use the
-            # deterministic mean for evaluation. No smoothing
-            # (alpha=1.0) to match how PPO was trained.
+            # PPO eval: deterministic policy MEAN via
+            # get_action() (tanh-squashed mean, no sampling).
+            # No smoothing (alpha=1.0) to match training.
             raw = np.asarray(
                 agent.get_action(state), dtype=np.float32
             )
@@ -315,6 +363,15 @@ def eval_route(env, act_fn, screen, font, route_key,
         f"spawn={spawn_idx} dest={dest_idx}"
     )
 
+    # Destination = final reference waypoint. The agent is
+    # open-loop (no goal), so without this it OVERRUNS the
+    # route and the post-destination wandering pollutes every
+    # metric (trajectory error, collisions, heatmap). We end
+    # the episode as a SUCCESS once the agent comes within
+    # DEST_RADIUS of the final waypoint.
+    DEST_RADIUS = 5.0  # metres
+    dest_xy = ref_xy[-1] if len(ref_xy) else None
+
     out_dir = f"results/{args.agent}_{args.traffic}"
     if args.noise > 0:
         out_dir += f"_noise{int(args.noise*100)}"
@@ -323,10 +380,9 @@ def eval_route(env, act_fn, screen, font, route_key,
     summaries = []
 
     for ep in range(1, args.episodes + 1):
-        # Force fixed spawn for this route. We set a hint the
-        # env can use; if the env ignores it we still measure
-        # against the reference and note the spawn.
-        env.unwrapped._eval_spawn_transform = start_tf
+        # Force fixed spawn for this route via the patched env
+        # API (carla_env v5 honors _eval_spawn_transform).
+        env.unwrapped.set_eval_spawn(start_tf)
         env.unwrapped._traffic_preset    = args.traffic
         env.unwrapped.cfg.TRAFFIC_LIGHTS = "off"
 
@@ -354,6 +410,20 @@ def eval_route(env, act_fn, screen, font, route_key,
             next_state, reward, done, trunc, info = \
                 env.step(action)
 
+            # carla_env.step() does NOT put collision/offroad
+            # into info, and it resets self._collision_flag to
+            # False at the END of step(). Derive the
+            # terminating collision/offroad from term_reason
+            # (set when the episode ends) plus the live env
+            # offroad flag captured here.
+            _term = info.get("term_reason")
+            step_collision = int(_term == "collision")
+            step_offroad   = int(
+                _term == "offroad"
+                or bool(getattr(
+                    env.unwrapped, "_offroad_flag", False))
+            )
+
             if env.unwrapped.vehicle:
                 loc = env.unwrapped.vehicle.get_location()
                 vel = env.unwrapped.vehicle.get_velocity()
@@ -379,12 +449,8 @@ def eval_route(env, act_fn, screen, font, route_key,
                     "brake"    : round(float(action[2]), 4),
                     "reward"   : round(reward, 4),
                     "ep_reward": round(ep_reward, 2),
-                    "collision": int(
-                        info.get("collision_flag", False)
-                    ),
-                    "offroad"  : int(
-                        info.get("offroad_flag", False)
-                    ),
+                    "collision": step_collision,
+                    "offroad"  : step_offroad,
                     "term"     : "",
                 })
 
@@ -392,6 +458,22 @@ def eval_route(env, act_fn, screen, font, route_key,
             prev_action = action
             ep_reward += reward
             step += 1
+
+            # Destination reached? (open-loop agent has no goal,
+            # so we end here as a SUCCESS before it overruns.)
+            if (dest_xy is not None
+                    and env.unwrapped.vehicle is not None):
+                loc = env.unwrapped.vehicle.get_location()
+                if math.hypot(loc.x - dest_xy[0],
+                              loc.y - dest_xy[1]) <= DEST_RADIUS:
+                    term_reason = "reached_dest"
+                    if records:
+                        records[-1]["term"] = term_reason
+                    logger.info(
+                        f"[{route_key}] reached destination "
+                        f"at step {step} — ending episode"
+                    )
+                    break
 
             ok = render_frame(
                 screen, font, env, args.traffic, route_key,
@@ -409,6 +491,15 @@ def eval_route(env, act_fn, screen, font, route_key,
                 term_reason = info.get("term_reason", "done")
                 if records:
                     records[-1]["term"] = term_reason
+                    # Stamp terminating collision/offroad on
+                    # the final logged step so the heatmap and
+                    # per-step stats reflect the end state.
+                    records[-1]["collision"] = int(
+                        term_reason == "collision"
+                    )
+                    records[-1]["offroad"] = int(
+                        term_reason == "offroad"
+                    )
                 break
 
         if term_reason is None:
@@ -419,6 +510,14 @@ def eval_route(env, act_fn, screen, font, route_key,
 
         # Metrics vs reference
         comp_frac, _ = ru.route_completion(agent_xy, ref_xy)
+        # If the agent reached the destination, completion is
+        # 1.0 by definition — the small shortfall is only the
+        # DEST_RADIUS stop margin, not a real failure to cover
+        # the route. Fractional completion then carries meaning
+        # ONLY for episodes that ended without reaching dest
+        # (collision/offroad/stuck/max_steps: how far they got).
+        if term_reason == "reached_dest":
+            comp_frac = 1.0
         mean_err, max_err = ru.trajectory_error(
             agent_xy, ref_xy
         )
@@ -432,12 +531,15 @@ def eval_route(env, act_fn, screen, font, route_key,
         )
         save_csv(records, csv_path)
 
-        # success = reached end of reference path (high
-        # completion) AND not terminated by collision/offroad
-        reached = comp_frac >= 0.90
+        # success = reached the destination cleanly, OR
+        # covered the route (>=90%) without a terminal failure.
+        # reached_dest is the primary success signal now that
+        # the episode ends at the destination.
+        reached = (term_reason == "reached_dest"
+                   or comp_frac >= 0.90)
         success = int(
             reached and term_reason not in
-            ("collision", "offroad", "wrong_way")
+            ("collision", "offroad", "wrong_way", "stuck")
         )
 
         summary = {
