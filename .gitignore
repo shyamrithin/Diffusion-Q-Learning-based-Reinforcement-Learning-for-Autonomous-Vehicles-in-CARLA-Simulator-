@@ -1,10 +1,60 @@
-checkpoints/
-checkpoints_old/
-runs/
+# ---- Python ----
 __pycache__/
-*.pyc
-*.pth
+*.py[cod]
 *.egg-info/
-*.hdf5
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+
+# ---- Virtual environments ----
+venv/
+.venv/
+env/
 .env
-Diffusion-Policies-for-Offline-RL/
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- Backups ----
+*.bak*
+*.orig
+*~
+
+# ---- Model checkpoints & weights (large binaries) ----
+checkpoints*/
+*.pth
+*.pt
+*.ckpt
+
+# ---- Datasets (large binaries) ----
+*.hdf5
+*.h5
+*.npy
+*.npz
+*.pkl
+
+# ---- Archives ----
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# ---- TensorBoard / training logs ----
+runs/
+ablation_logs/
+*.tfevents.*
+events.out.tfevents.*
+
+# ---- Generated results & recordings ----
+results/
+*.mp4
+*.avi
+*.mov
+
+# ---- Optional: uncomment to also exclude these ----
+# ablation_csv/
+# paper_figures/
